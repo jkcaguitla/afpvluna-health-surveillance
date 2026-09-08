@@ -15,7 +15,17 @@ Demo login (works immediately, no setup): `admin@afp-vluna.mil.ph` / `Admin@2026
   reads "AFP Health Surveillance & Records System". (The browser tab title
   still says "...— OB-GYN Department" since that wasn't part of the ask —
   say the word if you want that changed too.)
-- **Real, tested Supabase integration** — this is the big one, see below.
+- Your live Supabase project (`vlngjgyuzqupmvfpxcdn`) and publishable key
+  are wired into `APP_CONFIG` — `DB_MODE` is now `"supabase"` by default.
+- **Fixed a real bug from first deploy:** the app was trying to seed the
+  `legends` dropdown data (Rank, BOS, Departments, etc.) from the browser on
+  every page load, which its own RLS policy correctly rejected since nobody
+  is logged in yet at that point — you'd have seen a wall of "Sync error
+  saving to legends: row violates row-level security policy" toasts. That
+  seeding now happens once via SQL instead (`supabase-legends-seed.sql`,
+  see setup step 1b below) and the app no longer attempts it client-side in
+  Supabase mode at all, so that error loop is gone for good, not just
+  silenced.
 
 ## Setting up your Supabase backend
 
@@ -33,6 +43,18 @@ confirmed a regular user cannot self-promote to Admin by calling the API
 directly (a privilege-escalation trigger blocks it), confirmed Staff-level
 users can create records but not delete them, and confirmed the bootstrap
 step below actually works.
+
+**1b. Seed the dropdown reference data (Rank, BOS, Departments, etc.).**
+Also in the SQL Editor, paste and run `supabase-legends-seed.sql`. This has
+to be a separate SQL step rather than something the app does for itself on
+first load: the `legends` table's insert policy correctly requires
+Admin/Chief Resident, but nobody is logged in yet on a brand-new project —
+so seeding it from the browser would always get blocked by the very policy
+protecting it. (If you tried the app before this file existed and saw a wall
+of "Sync error saving to legends: new row violates row-level security
+policy" toasts, this is the fix — that loop is now gone entirely, since the
+app no longer attempts to seed legends client-side in Supabase mode at all.)
+Safe to re-run; it skips rows that already exist.
 
 **2. Turn off email confirmation** (recommended for this app).
 In your Supabase project: Authentication → Providers → Email → turn off

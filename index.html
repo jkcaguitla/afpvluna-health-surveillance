@@ -723,6 +723,7 @@ const DB = (() => {
   let cache = {}; // supabase-mode in-memory mirror: { patients: [...], cases: [...], ... }
   TABLES.forEach(t => cache[t] = []);
   let hydrated = false;
+  let lastHydrateErrors = {}; // { tableName: errorMessage } — see init()
 
   function uid() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -761,6 +762,25 @@ const DB = (() => {
     return sbClient;
   }
 
+  // Retry wrapper for background Supabase writes — same rationale as init()'s
+  // read retries: transient interference (e.g. a browser extension's fetch
+  // interceptor) is common enough to be worth a couple of automatic retries
+  // before bothering the person with a toast.
+  async function syncWithRetry(fn, label) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const { error } = await fn();
+        if (!error) return;
+        lastErr = error.message;
+      } catch (e) {
+        lastErr = e.message;
+      }
+      if (attempt < 3) await new Promise(r => setTimeout(r, 300 * attempt));
+    }
+    toast(`Sync error (${label}): ${lastErr}`);
+  }
+
   // ---- public API ---------------------------------------------------
   const api = {
     get mode() { return mode(); },
@@ -775,13 +795,36 @@ const DB = (() => {
     async init() {
       if (mode() !== "supabase") { hydrated = true; return; }
       const client = getClient();
+      lastHydrateErrors = {};
       await Promise.all(TABLES.map(async (t) => {
-        const { data, error } = await client.from(t).select("*").order("created_at", { ascending: false });
-        if (error) { console.error("Hydrate failed for", t, error.message); return; }
-        cache[t] = data || [];
+        // Retry a couple of times — the errors this most commonly surfaces
+        // (e.g. a browser extension's injected fetch-interceptor throwing a
+        // DataCloneError trying to relay a Headers object) are transient
+        // interference from OUTSIDE this app, not our request failing at
+        // Supabase's end, so a quick retry often just works.
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const { data, error } = await client.from(t).select("*").order("created_at", { ascending: false });
+            if (error) { lastErr = error.message; }
+            else { cache[t] = data || []; lastErr = null; break; }
+          } catch (e) {
+            lastErr = e.message;
+          }
+          if (lastErr && attempt < 3) await new Promise(r => setTimeout(r, 300 * attempt));
+        }
+        if (lastErr) {
+          console.error("Hydrate failed for", t, "after 3 attempts:", lastErr);
+          lastHydrateErrors[t] = lastErr;
+        }
       }));
       hydrated = true;
     },
+
+    // Which tables (if any) failed to hydrate on the last init(), and why —
+    // used by app.js to show a clear diagnostic instead of silently leaving
+    // that table's data empty.
+    getLastHydrateErrors() { return lastHydrateErrors; },
 
     all(table) {
       return readTable(table);
@@ -801,9 +844,7 @@ const DB = (() => {
       rows.push(rec);
       writeTable(table, rows);
       if (mode() === "supabase") {
-        getClient().from(table).insert(rec).then(({ error }) => {
-          if (error) toast(`Sync error saving to ${table}: ${error.message}`);
-        });
+        syncWithRetry(() => getClient().from(table).insert(rec), `saving to ${table}`);
       }
       if (table !== "activity_logs") {
         this._log(table, rec.id, "create", actor, null, rec);
@@ -820,9 +861,7 @@ const DB = (() => {
       rows[idx] = after;
       writeTable(table, rows);
       if (mode() === "supabase") {
-        getClient().from(table).update(patch).eq("id", id).then(({ error }) => {
-          if (error) toast(`Sync error updating ${table}: ${error.message}`);
-        });
+        syncWithRetry(() => getClient().from(table).update(patch).eq("id", id), `updating ${table}`);
       }
       if (table !== "activity_logs") {
         this._log(table, id, "update", actor, before, after);
@@ -836,9 +875,7 @@ const DB = (() => {
       const next = rows.filter(r => r.id !== id);
       writeTable(table, next);
       if (mode() === "supabase") {
-        getClient().from(table).delete().eq("id", id).then(({ error }) => {
-          if (error) toast(`Sync error deleting from ${table}: ${error.message}`);
-        });
+        syncWithRetry(() => getClient().from(table).delete().eq("id", id), `deleting from ${table}`);
       }
       if (table !== "activity_logs" && before) {
         this._log(table, id, "delete", actor, before, null);
@@ -908,7 +945,14 @@ const DB = (() => {
     // account comes from Signup; see the README for how to promote it to
     // Admin the first time (there's no admin yet to approve it).
     seedIfEmpty() {
-      if (this.all("legends").length === 0) {
+      // Legends (dropdown reference data) is seeded via SQL in supabase mode
+      // — supabase/legends-seed.sql, run once in the SQL Editor. Doing it from
+      // the browser would need to run before anyone is logged in, which the
+      // legends table's own RLS policy (Admin/Chief Resident only) correctly
+      // refuses — that's not a bug to route around client-side, it's the
+      // policy doing its job. Local demo mode still self-seeds since there's
+      // no RLS to fight there.
+      if (mode() === "local" && this.all("legends").length === 0) {
         for (const [key, val] of Object.entries(LEGENDS_SEED)) {
           this.insert("legends", { category: key, data: val });
         }
@@ -3259,6 +3303,18 @@ const NAV_ITEMS = [
 
 function currentUser() { return DB.getSession(); }
 
+function reportHydrateIssues() {
+  const errs = DB.getLastHydrateErrors ? DB.getLastHydrateErrors() : {};
+  const tables = Object.keys(errs);
+  if (!tables.length) return;
+  const looksLikeExtensionInterference = Object.values(errs).some(m => /DataCloneError|postMessage|could not be cloned/i.test(m));
+  const hint = looksLikeExtensionInterference
+    ? " This looks like a browser extension interfering with network requests (common with ad-blockers or AI-assistant extensions) — try Incognito mode or a different browser to confirm."
+    : "";
+  toast(`Could not load ${tables.join(", ")} from Supabase after retrying.${hint}`);
+  console.warn("Hydrate issues:", errs);
+}
+
 function requireAdmin() {
   const u = currentUser();
   return u && u.user_level === "Admin";
@@ -3432,11 +3488,12 @@ function renderShell() {
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     document.getElementById("sidebar").classList.toggle("collapsed");
   });
+
   document.getElementById("refreshBtn").addEventListener("click", async () => {
     if (APP_CONFIG.DB_MODE === "supabase") {
       const btn = document.getElementById("refreshBtn");
       btn.disabled = true;
-      try { await DB.init(); toast("Synced latest from Supabase."); }
+      try { await DB.init(); reportHydrateIssues(); if (!Object.keys(DB.getLastHydrateErrors()).length) toast("Synced latest from Supabase."); }
       catch (e) { toast("Sync failed: " + e.message); }
       btn.disabled = false;
     }
@@ -3493,6 +3550,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       </div></div>`;
     try {
       await DB.init();
+      reportHydrateIssues(); // per-table failures after retries — non-fatal, but worth surfacing
     } catch (e) {
       document.getElementById("root").innerHTML = `
         <div class="login-wrap"><div class="login-card">
