@@ -1,105 +1,129 @@
-# AFP VLUNA — OB-GYN Health Surveillance & Record System (Demo Build)
+# AFP Medical Center — OB-GYN Health Surveillance System
 
-A single-file web app (`index.html`) for the Armed Forces of the Philippines
-OB-GYN Department, backed by Supabase for the demo. Built mobile-first.
+A single-file web app (`index.html`) for the AFP Medical Center OB-GYN Department, backed by Supabase. Military-green themed, mobile-friendly, and built so each module's logic is easy to find and troubleshoot independently.
 
-> **⚠️ This is a working demo scaffold, not a finished production system.**
-> It implements the full navigation, auth, database schema, and the core
-> workflows for every module in the spec. A few things are intentionally
-> left as **`TASK: TO BE UPDATED`** — search the code for that exact phrase
-> to find them all. See "What's Left" below.
+## Files in this delivery
+| File | Purpose |
+|---|---|
+| `index.html` | The entire web app — HTML, CSS, and JS in one file (logo embedded). This is what you deploy/host. |
+| `supabase_schema.sql` | Paste into Supabase's SQL Editor once to create every table, trigger, security rule, and seed the dropdown lists ("Legends"). |
+| `README.md` | This file. |
 
 ---
 
-## 1. Deploy in ~10 minutes
+## 1. Set up Supabase (5 minutes)
 
-### A. Supabase (backend)
-1. Go to [supabase.com](https://supabase.com) → New Project (pick a region close to the Philippines, e.g. Singapore).
-2. Open **SQL Editor → New query**, paste the entire contents of `supabase_schema.sql`, click **Run**.
-3. Go to **Project Settings → API** and copy:
-   - `Project URL`
-   - `anon public` key
-4. Open `index.html`, find this block near the top of the `<script>` section (search `JS:CONFIG`):
-   ```js
-   const SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co";   // TASK: TO BE UPDATED
-   const SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";               // TASK: TO BE UPDATED
-   ```
-   Replace both with your real values and save.
-5. In **Authentication → Providers → Email**, turn **Confirm email OFF** for the demo (so new sign-ups can log in immediately, still gated by your Admin approval). Turn it back ON for production.
+1. Go to [supabase.com](https://supabase.com) → create a free project (choose a region close to the Philippines, e.g. Singapore).
+2. In your project, go to **SQL Editor → New query**, paste the **entire contents of `supabase_schema.sql`**, and click **Run**. This creates:
+   - `profiles`, `directory`, `patients`, `cases`, `opd`, `tasks`, `activity_logs`, `legends`
+   - Triggers so every new signup gets a profile row, and every **Approved** user is automatically mirrored into **Directory**
+   - Row Level Security (only approved users can read/write; only Admin/Chief Resident can delete or approve)
+   - All the dropdown values from the spec (Rank, BOS, PC, Department, Designation, Comorbidities, OB-GYN Procedures, Indications for Primary CS, Discharge Status, OB/GYNE Reasons, etc.) pre-loaded into the `legends` table
+3. Go to **Project Settings → API**. Copy:
+   - **Project URL**
+   - **anon public key**
+4. **Turn off "Confirm email"** for a smoother demo: **Authentication → Providers → Email → toggle "Confirm email" off** (or, if you keep it on, users must click the confirmation link before they can log in).
 
-### B. GitHub
-1. Create a new repository, e.g. `afp-vluna-obgyn`.
-2. Upload `index.html` (and this `README.md`, `supabase_schema.sql` for reference) to the repo root.
+## 2. Connect the app to Supabase
 
-### C. Vercel or Cloudflare Pages (frontend hosting)
-- **Vercel:** New Project → Import your GitHub repo → Framework preset "Other" → Build command *empty* → Output directory `/` → Deploy.
-- **Cloudflare Pages:** Create a project → Connect to Git → your repo → Build command *empty* → Build output directory `/` → Deploy.
+Open `index.html` in a text editor, find this near the top of the `<script>` section:
 
-Either way, since this is a static single HTML file, no build step is required.
+```js
+const SUPABASE_URL = "YOUR_SUPABASE_URL_HERE";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY_HERE";
+```
 
-### D. Create your first Admin
-1. Open your deployed URL and **Sign Up** with your own details.
-2. Back in Supabase **SQL Editor**, run:
+Paste in the values from step 1.3. Save the file. That's the **only** required edit.
+
+## 3. Create your first Admin account
+
+1. Open `index.html` in a browser (double-click it, or host it — see below).
+2. Click **Sign Up**, fill out the registration form (Designation and Rank are now dropdowns), and submit.
+3. You'll see "awaiting Admin approval" — this is expected, every new account starts as **Pending**.
+4. Back in Supabase **SQL Editor**, run (replace the email):
    ```sql
-   update public.profiles set user_level = 'Admin', approved = true
-   where email = 'your-admin-email@example.com';
+   update public.profiles
+     set user_level = 'Admin', status = 'Approved',
+         access_control = '["OPD","Overview","Directory","Cases","Legends","Activity Logs","Users","Tasks","Wards","Patient Record"]'
+   where email = 'youremail@example.com';
    ```
-3. Log back in — you now see **Users** and **Legends** in the sidebar, and can approve everyone else from the **Users** module.
+5. Log in again in the app — you now have full Admin access, including approving every future user from the **Users** module (no more manual SQL needed after this).
+
+## 4. Hosting
+
+`index.html` is fully static — host it anywhere:
+- Easiest: drag-and-drop the file into [Netlify Drop](https://app.netlify.com/drop) or Vercel.
+- Or serve it from any web server / intranet server your unit already runs.
+- No build step, no npm install — it's plain HTML/CSS/JS + the Supabase CDN script tag.
 
 ---
 
-## 2. Security notes (demo-appropriate, tighten before real use)
+## What was updated in this build (per your latest requests)
 
-- **Auth:** Supabase Auth (email + password). Passwords are hashed by Supabase, never touched by this app's code.
-- **Row Level Security (RLS)** is enabled on every table. A user can only read/write a module's data if:
-  - their account is `approved = true`, **and**
-  - their `access_control` JSON has that module set to `true` (or they are `Admin`, who can access everything).
-- **Delete** is restricted to `Admin` on every module, matching the spec.
-- **Case edits** made by non-Admin/non-Chief-Resident users are flagged `needs_admin_approval = true` in the database — the app shows a pending banner until an Admin or Chief Resident clears it.
-- The **anon key** is meant to be public — it only unlocks what your RLS policies allow, never more.
-- For a real government deployment, also turn on: email confirmation, a strong password policy in Supabase Auth settings, and consider Supabase's audit-log add-ons or a WAF in front of Cloudflare/Vercel.
+**Login Page**
+- Sign-up **Designation** field is now a dropdown (pulled live from the `legends` table, so Admin can add more designations later from the Legends module without touching code).
 
-## 3. Migrating off Supabase later (Oracle or otherwise)
+**Users → Directory**
+- The moment an Admin/Chief Resident **Approves** a pending user, a Postgres trigger automatically inserts/updates that person in the **Directory** table. No manual step needed, and it stays in sync if their name/rank/department is edited later.
 
-The spec asked for this to be easy — here's how it's set up:
+**Directory**
+- Lists every approved system user (tagged "Registered User") plus any manually added contacts (e.g., doctors who don't need system logins), all in one list.
 
-- Every single database call in the app goes through one object: **`DB`** (search `JS:DB` in `index.html`). No other code calls `supabase-js` directly.
-- To migrate: rewrite the methods inside `DB` to call your new backend (e.g. a REST API in front of Oracle) instead of `sb.from(...)`. Every module (`Modules.patient_record`, `Modules.cases`, etc.) keeps working unchanged, because they only ever call `DB.patients.list()`, `DB.cases.create()`, and so on.
-- The schema avoids Postgres-only features where practical. `jsonb` columns (used for the multi-tab Case/OPD forms) map to `CLOB`/JSON columns on Oracle; `text[]` (used for Final Diagnosis bullets) maps to a small child table.
-- Row Level Security would need to be re-implemented as either database views/procedures or as checks inside your new API layer.
+**OPD**
+- "Consultant in-charge" and "Resident in-charge" are now **+ Add** buttons that open a searchable picker pulling names straight from the Directory. Add as many as needed; each becomes a removable chip.
+- "OB Reason" is now a **+ Add OB Reason** multi-picker (same searchable-chip pattern) — add as many as needed.
 
-## 4. What's already working
+**Cases**
+- The OB-GYN Procedures list is no longer a native `<select>` (which is why long procedure names were pushing buttons off-screen). It's now a custom **searchable dropdown** that scrolls internally and always fits the screen, on both desktop and mobile.
+- "Indication for PRIMARY CS" is now a **+ Add** multi-picker — add as many as needed.
+- "Surgeon" is now a **+ Add SURGEON** multi-picker pulling doctors from the Directory — add as many as needed.
 
-- Login / Sign-up (with Admin-approval gate) / Log out / Refresh / My Profile
-- Collapsible sidebar nav, gated per-user by the Access Control checklist
-- **Overview** — live stat cards + OB vs GYNE and Cases-by-Department charts
-- **Patient Record** — create/search/filter/edit/delete, linked Cases shown on profile
-- **Cases** — department picker → full 8-tab OB-GYN form (Admission, Obstetric History,
-  Co-morbidities, Gynecological Conditions, MIGS, Blood, Final Diagnosis, Discharge),
-  auto BMI, auto hospital-days, "+Not in the list" adds new dropdown options live,
-  Admin/Chief-Resident approval flag on edits, Cases Data Summary with charts
-- **OPD** — 5-tab form (Information, Consultation, Procedures, Final Diagnosis, Actions),
-  OPD Data Summary with a monthly trend chart
-- **Tasks** — assign by module, acknowledge, complete with notes
-- **Directory** — add/search/edit contacts
-- **Users** — list, search, approve/decline, per-module Access Control checklist, activity history
-- **Activity Logs** — every create/update/delete is logged and filterable by module/user/date
-- **Legends** — every dropdown in the system is admin-editable and pre-seeded from your spec
-- Fully responsive/mobile layout (collapsible hamburger sidebar, stacked forms)
-- Philippine Time (Asia/Manila) used for all displayed dates/times
+**Tasks**
+- Simple task creation: assign a **User**, pick the **Module**, describe the **Task**, set a **Due Date**.
+- Tasks are clickable → opens the full assignment with an **Action/Completion notes** field the assignee fills in to close it out.
+- An **Acknowledge** button (plus "Mark In-Process") lets the assignee signal they've seen/started the task before marking it Completed.
 
-## 5. TASK: TO BE UPDATED (left for a follow-up pass)
+---
 
-Search `index.html` for the literal phrase **`TASK: TO BE UPDATED`** — each spot is commented in place. In summary:
+## Module map (for future maintenance)
 
-- **Wards module** — spec says "to follow upon the next update"; a placeholder screen and an empty `wards` table are in place, nothing else.
-- **Other departments' Case forms** (Internal Medicine, Surgery, Pediatrics, etc.) — only OB-GYN's 8-tab form is built, per the spec's "for now the web-app is for OB-GYN Department." Selecting another department shows a friendly "not built yet" message instead of crashing.
-- **CSV Import/Export & downloadable CSV templates** — mentioned throughout the spec (Patient Record, Cases, OPD, Legends) — not implemented in this pass; wire these up against `DB.patients`, `DB.cases`, `DB.opd`, `DB.legend_options` using a small CSV parser (e.g. PapaParse) when you're ready.
-- **PDF export/download buttons** — currently trigger the browser's print dialog as a placeholder; swap in a proper PDF library (e.g. jsPDF) for formatted letterhead output matching your reference report.
-- **Supabase → your production URL/key** — see §1.A step 4.
+Every module's rendering + data functions are grouped and commented in numbered sections inside the single `<script>` block, in this order:
 
-## 6. File map
+1. Config & state
+2. Generic helpers (dates, toasts, modal, activity logging, the reusable "searchable multi-add" and "bullet list" components used everywhere)
+3. Legends + Directory cache loaders
+4. Auth (login, signup, session, sidebar/access-control)
+5. Init
+6. Overview
+7. Users
+8. Directory
+9. Profile (self)
+10. Patient Record
+11. Cases (8-tab form)
+12. OPD (5-tab form)
+13. Tasks
+14. Legends (admin CRUD for every dropdown)
+15. Activity Logs
+16. Wards (placeholder — "to follow upon the next update," as specified)
 
-- `index.html` — the entire application (HTML + CSS + JS in one file, per the requirement). Internally organized into clearly commented blocks (`STYLE:*`, `HTML:*`, `JS:*`) by module, so any one module (e.g. Cases) can be edited without touching the others.
-- `supabase_schema.sql` — full schema, security policies, and seed data for every dropdown list in the spec.
-- `README.md` — this file.
+Because each module owns its own `render_<module>()` function and its own DB calls, you can edit or fix one module (e.g. Cases) without touching any other module's code — exactly the "separate code per tab" requirement from the spec.
+
+## Extensible dropdowns ("Legends")
+Every list in the app (Rank, BOS, Department, Comorbidities, OB-GYN Procedures, Discharge Status, etc.) reads from the `legends` table at runtime. Add, edit, or retire any value from the in-app **Legends** module (or directly in Supabase) — no code change or redeploy needed. "+ Not in the list" buttons in the Cases form write straight into `legends` too, so the next person sees the new option immediately.
+
+## Migrating off Supabase later
+The app only talks to the database through the `supabase.from('table')...` calls inside each module's functions — there's no ORM or vendor-specific SQL scattered in the UI code. To move to Oracle or another platform:
+1. Recreate the same tables/columns (schema is plain, portable SQL — see `supabase_schema.sql`; JSONB columns become CLOB/JSON columns in Oracle).
+2. Replace the Supabase JS client init and the `.from().select()/.insert()/.update()/.delete()` calls with your new platform's client (a thin data-access wrapper). Because every module calls these in the same handful of patterns, this is a mechanical find-and-replace rather than a rewrite.
+3. Re-implement the two triggers (`profiles`→`directory` sync, case-number generator) as stored procedures/triggers in the new database, or move that logic into the app layer.
+
+## Known simplifications in this demo build (roadmap)
+The master spec is very large; this build focuses on making every module **functional end-to-end** with the specific fixes you asked for. Not yet built (flagged so nothing is silently missing):
+- Advanced dashboard graphs (weekly/monthly/yearly bar charts, top-10 admission causes, death-rate monitoring formulas, BOS/PC/Rank breakdown charts) — Overview/Cases/OPD currently show live **stat cards** instead; the underlying data (cases, opd, patients tables) already supports adding charts (e.g. with Chart.js) later.
+- Case/OPD/Patient CSV **import** is implemented for Patient Record; Cases/OPD import is stubbed (needs a field-mapping decision from your team since those forms are multi-tab).
+- "PDF" downloads currently use the browser's print dialog (Save as PDF) rather than a generated PDF file — this keeps the app dependency-free; a proper PDF library can be added if a branded PDF layout is required.
+- Only the **Obstetrics and Gynecology (OB-GYN)** case form is built; other departments are selectable in "+ New Case" but show a "coming soon" message, per the spec's phased rollout.
+- Wards module is a placeholder, per the spec ("to follow upon the next update").
+
+## Security note
+This is explicitly a **demo-grade** RLS setup (any approved user can read/write clinical data; only Admin/Chief Resident can delete or approve). Before real deployment with government health data, tighten Row Level Security further (e.g., per-department access, audit-only fields, encrypted-at-rest columns for PII) and put the app behind your unit's VPN/intranet.

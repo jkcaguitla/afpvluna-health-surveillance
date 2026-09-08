@@ -1,464 +1,390 @@
 -- ============================================================================
--- AFP VLUNA — OB-GYN HEALTH SURVEILLANCE & RECORD SYSTEM
--- Supabase (PostgreSQL) Schema — v0.1 (DEMO)
--- Timezone: Asia/Manila (Philippine Standard Time)
+-- AFP MEDICAL CENTER — OB-GYN HEALTH SURVEILLANCE SYSTEM
+-- Supabase Schema (PostgreSQL)
+-- Paste this whole file into: Supabase Dashboard -> SQL Editor -> New query -> Run
 -- ============================================================================
--- HOW TO USE
---   1. Create a new Supabase project.
---   2. Open SQL Editor > New query > paste this whole file > Run.
---   3. In Authentication > Providers, make sure "Email" is enabled and
---      "Confirm email" is set per your preference (OFF is easier for a demo).
---   4. Copy your Project URL and anon public key into config.js in the app.
---   5. Create the first ADMIN manually after signing up once (see bottom).
---
--- MIGRATION NOTE (per requirement: must be easy to move off Supabase)
---   - No Supabase-proprietary features are used beyond: `auth.users`,
---     Row Level Security (standard Postgres), and Storage (optional, for
---     future file attachments). Everything else is plain ANSI-ish SQL that
---     runs on any Postgres instance.
---   - If migrating to Oracle or another RDBMS: recreate `profiles` as your
---     own users table decoupled from `auth.users`, re-implement `auth_uid()`
---     to return the current session's user id, and re-write RLS as
---     view/procedure-level checks or application-layer checks. All table
---     and column names are portable (snake_case, no Postgres-only types
---     except `uuid`, `jsonb`, `text[]` — swap `jsonb` for `CLOB`/JSON and
---     `text[]` for a child table on Oracle).
+-- Notes:
+-- 1) Uses Supabase Auth (auth.users) for login. profiles is a 1-1 extension.
+-- 2) "legends" is a generic, extensible lookup table so every dropdown in the
+--    app (Rank, BOS, PC, Department, Designation, Comorbidity, Procedures,
+--    Indications, Reasons, etc.) can have new options added without a schema
+--    change or redeploy. This is what the spec calls "Legends Module".
+-- 3) A trigger auto-mirrors every approved user into the "directory" table,
+--    satisfying: "Registered Users automatically registered to Directory".
+-- 4) Data-heavy fields for Cases/OPD (tabs, multi-add lists, notes) are kept
+--    as JSONB so the form structure can evolve without migrations, while
+--    core reporting fields are real columns for fast filtering/graphs.
+-- 5) Everything is written in plain, portable SQL/JSON so migrating off
+--    Supabase to Oracle/Postgres/etc later mainly means re-pointing the
+--    thin data-access layer in the HTML file (see js: const db = {...}).
 -- ============================================================================
 
+-- Timezone: Philippine Standard Time for this session's DDL defaults
 set timezone = 'Asia/Manila';
 
--- ----------------------------------------------------------------------------
--- EXTENSIONS
--- ----------------------------------------------------------------------------
-create extension if not exists "uuid-ossp";
+-- ---------------------------------------------------------------------------
+-- Extensions
+-- ---------------------------------------------------------------------------
 create extension if not exists pgcrypto;
 
--- ----------------------------------------------------------------------------
--- 1. PROFILES  (extends auth.users — Login / Users Module)
--- ----------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 1. LEGENDS (extensible dropdown lists)
+-- ---------------------------------------------------------------------------
+create table if not exists public.legends (
+  id uuid primary key default gen_random_uuid(),
+  category text not null,          -- e.g. 'rank','bos','pc','department','designation',
+                                    -- 'comorbidity','ob_admission_reason','ob_gyn_procedure',
+                                    -- 'indication_primary_cs','discharge_status','ob_reason',
+                                    -- 'gyne_reason','ob_opd_procedure','family_planning','evac_from'
+  value text not null,
+  sort_order int default 0,
+  active boolean default true,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now()
+);
+create unique index if not exists legends_category_value_uidx on public.legends (category, lower(value));
+create index if not exists legends_category_idx on public.legends (category);
+
+-- ---------------------------------------------------------------------------
+-- 2. PROFILES (extends auth.users)
+-- ---------------------------------------------------------------------------
 create table if not exists public.profiles (
-  id                uuid primary key references auth.users(id) on delete cascade,
-  email             text not null unique,
-  last_name         text not null,
-  first_name        text not null,
-  middle_name       text,
-  gender            text check (gender in ('Male','Female')),
-  designation       text,
-  rank              text,
-  department        text,
-  address           text,
-  contact_number    text,
-  birthdate         date,
-  user_level        text not null default 'Junior'
-                      check (user_level in ('Admin','Chief Resident','Resident','Senior','Junior','Staff')),
-  approved          boolean not null default false,
-  -- Access Control checklist per module (spec: OPD, Overview, Directory, Cases,
-  -- Legends, Activity Logs, Users, Tasks, Wards, Patient Record)
-  access_control    jsonb not null default '{
-    "overview": true, "patient_record": true, "cases": true, "opd": true,
-    "wards": false, "tasks": true, "directory": true, "users": false,
-    "activity_logs": false, "legends": false
-  }'::jsonb,
-  created_at        timestamptz not null default now(),
-  updated_at        timestamptz not null default now()
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text not null,
+  last_name text,
+  first_name text,
+  middle_name text,
+  gender text check (gender in ('Male','Female')),
+  designation text,                 -- dropdown, from legends category 'designation'
+  rank text,
+  department text,
+  address text,
+  contact_number text,
+  birthdate date,
+  user_level text default 'Pending' check (user_level in ('Pending','Admin','Chief Resident','Resident','Senior','Junior','Staff')),
+  status text default 'Pending Approval' check (status in ('Pending Approval','Approved','Declined')),
+  access_control jsonb default '[]'::jsonb, -- e.g. ["OPD","Overview","Directory","Cases","Legends","Activity Logs","Users","Tasks","Wards","Patient Record"]
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
 
-comment on table public.profiles is 'App user profile, 1:1 with auth.users. approved=false blocks module access until an Admin approves.';
+-- age is derived at query time (kept as a generated column for convenience)
+alter table public.profiles drop column if exists age;
+alter table public.profiles add column age int generated always as
+  (date_part('year', age(birthdate))::int) stored;
 
--- age is computed on the fly in the app / views, not stored (avoids drift)
-create or replace view public.profiles_with_age as
-  select *, date_part('year', age(current_date, birthdate))::int as age
-  from public.profiles;
-
--- ----------------------------------------------------------------------------
--- 2. LEGENDS / DEFINITIONS  (Legends Module)
--- Generic key-value catalog so every dropdown in the app can be extended by
--- an Admin without a code deploy, per spec: "these definitions should be in
--- the database so the system can always add new selections."
--- ----------------------------------------------------------------------------
-create table if not exists public.legend_options (
-  id            uuid primary key default gen_random_uuid(),
-  category      text not null,   -- e.g. 'rank','bos','pc','ps','department',...
-  value         text not null,
-  sort_order    int not null default 0,
-  is_active     boolean not null default true,
-  created_by    uuid references public.profiles(id),
-  created_at    timestamptz not null default now(),
-  unique (category, value)
+-- ---------------------------------------------------------------------------
+-- 3. DIRECTORY (hospital contact directory — includes all registered users
+--    PLUS manually-added contacts who may not have a login)
+-- ---------------------------------------------------------------------------
+create table if not exists public.directory (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid references public.profiles(id) on delete set null, -- null = manual contact
+  last_name text,
+  first_name text,
+  middle_name text,
+  gender text check (gender in ('Male','Female')),
+  rank text,
+  department text,
+  designation text,
+  contact_number text,
+  email text,
+  address text,
+  birthdate date,
+  emergency_contact_name text,
+  emergency_contact_number text,
+  is_doctor boolean default false, -- true for OB-Surgeon/OB-Doctor designations, used for OPD/Cases pickers
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
+alter table public.directory drop column if exists age;
+alter table public.directory add column age int generated always as
+  (date_part('year', age(birthdate))::int) stored;
 
-create index if not exists idx_legend_category on public.legend_options(category);
-
--- ----------------------------------------------------------------------------
--- 3. PATIENTS  (Patient Record Module)
--- ----------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 4. PATIENT RECORD
+-- ---------------------------------------------------------------------------
 create table if not exists public.patients (
-  id                uuid primary key default gen_random_uuid(),
-  gender            text check (gender in ('Male','Female')),
-  last_name         text not null,
-  first_name        text not null,
-  middle_name       text,
-  birthdate         date,
-  rank              text,
-  bos               text,
-  pc                text,        -- Patient Category
-  care_of           text,        -- Military Care Of
-  address           text,
-  contact_number    text,
-  email             text,
-  notes             text,
-  status            text not null default 'Non-Admitted'
-                      check (status in ('Admitted','Discharged','Deceased','Non-Admitted')),
-  created_by        uuid references public.profiles(id),
-  created_at        timestamptz not null default now(),
-  updated_at        timestamptz not null default now()
+  id uuid primary key default gen_random_uuid(),
+  last_name text,
+  first_name text,
+  middle_name text,
+  gender text check (gender in ('Male','Female')),
+  birthdate date,
+  rank text,
+  bos text,       -- Branch of Service
+  pc text,        -- Patient Category
+  ps text default 'Non-Admitted' check (ps in ('Admitted','Discharged','Deceased','Non-Admitted')),
+  care_of text,
+  address text,
+  contact_number text,
+  email text,
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
+alter table public.patients drop column if exists age;
+alter table public.patients add column age int generated always as
+  (date_part('year', age(birthdate))::int) stored;
+create index if not exists patients_name_idx on public.patients (last_name, first_name);
 
-create index if not exists idx_patients_lastname on public.patients (last_name);
-create index if not exists idx_patients_status on public.patients (status);
-
--- ----------------------------------------------------------------------------
--- 4. CASES  (Cases Module — currently OB-GYN; other departments TBD)
--- The 8-tab OB-GYN form is stored as structured jsonb per tab so new
--- department forms can be added later without a schema migration.
--- ----------------------------------------------------------------------------
-create sequence if not exists case_number_seq start 1;
-
+-- ---------------------------------------------------------------------------
+-- 5. CASES (OB-GYN case form — 8 tabs stored as JSONB "data" + key columns)
+-- ---------------------------------------------------------------------------
 create table if not exists public.cases (
-  id                  uuid primary key default gen_random_uuid(),
-  case_number         text not null unique default ('C-' || to_char(now(),'YYYY') || '-' || lpad(nextval('case_number_seq')::text,5,'0')),
-  department          text not null default 'Obstetrics and Gynecology (OB-GYN)',
-  patient_id          uuid references public.patients(id),
-  case_type           text check (case_type in ('OB','GYNE')),
-  status              text not null default 'Admitted'
-                        check (status in ('Admitted','Discharged','Deceased')),
-
-  -- Tab 1: Admission
-  admission           jsonb not null default '{}'::jsonb,
-  -- Tab 2: Obstetric History (Obstetric Score) — G,P,FT,PT,Ab
-  obstetric_history    jsonb not null default '{}'::jsonb,
-  -- Tab 3: Co-morbidities — array of {category, value}
-  comorbidities        jsonb not null default '[]'::jsonb,
-  -- Tab 4: Gynecological Conditions (reasons, procedures, indications, surgeon)
-  gyne_conditions      jsonb not null default '{}'::jsonb,
-  -- Tab 5: MIGS Information
-  migs                 jsonb not null default '{}'::jsonb,
-  -- Tab 6: Blood (not required)
-  blood                jsonb not null default '{}'::jsonb,
-  -- Tab 7: Final Diagnosis — array of bullet strings
-  final_diagnosis      text[] not null default '{}',
-  -- Tab 8: Discharge
-  discharge            jsonb not null default '{}'::jsonb,
-
-  needs_admin_approval boolean not null default false, -- edits after finalization need Admin/Chief Resident sign-off
-  created_by          uuid references public.profiles(id),
-  updated_by          uuid references public.profiles(id),
-  created_at          timestamptz not null default now(),
-  updated_at          timestamptz not null default now()
+  id uuid primary key default gen_random_uuid(),
+  case_no text unique,
+  department text default 'Obstetrics and Gynecology (OB-GYN)',
+  patient_id uuid references public.patients(id),
+  case_type text check (case_type in ('OB','GYNE')),
+  status text default 'Admitted' check (status in ('Admitted','Discharged','Deceased')),
+  admission_date date,
+  discharge_date date,
+  surgeons jsonb default '[]'::jsonb,             -- array of directory ids/names
+  indications_primary_cs jsonb default '[]'::jsonb, -- array of strings
+  comorbidities jsonb default '[]'::jsonb,
+  ob_gyn_admission_reasons jsonb default '[]'::jsonb,
+  ob_gyn_procedures jsonb default '[]'::jsonb,
+  final_diagnosis jsonb default '[]'::jsonb,       -- array of bullet strings
+  data jsonb default '{}'::jsonb,                  -- everything else (all 8 tabs)
+  needs_admin_approval boolean default false,
+  approved boolean default true,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
+create sequence if not exists public.case_no_seq start 1;
+create index if not exists cases_patient_idx on public.cases (patient_id);
+create index if not exists cases_status_idx on public.cases (status);
 
-create index if not exists idx_cases_patient on public.cases(patient_id);
-create index if not exists idx_cases_status on public.cases(status);
-create index if not exists idx_cases_department on public.cases(department);
-create index if not exists idx_cases_created_at on public.cases(created_at);
-
--- ----------------------------------------------------------------------------
--- 5. OPD VISITS  (Outpatient Department Module)
--- ----------------------------------------------------------------------------
-create table if not exists public.opd_visits (
-  id                uuid primary key default gen_random_uuid(),
-  patient_id        uuid references public.patients(id),
-  consultation_date date not null default current_date,
+-- ---------------------------------------------------------------------------
+-- 6. OPD (Outpatient Department)
+-- ---------------------------------------------------------------------------
+create table if not exists public.opd (
+  id uuid primary key default gen_random_uuid(),
+  consultation_date date default (now() at time zone 'Asia/Manila')::date,
+  patient_id uuid references public.patients(id),
   registration_status text check (registration_status in ('Registered','Not-Registered','New','Old')),
-  info              jsonb not null default '{}'::jsonb,          -- Tab 1
-  consultation      jsonb not null default '{}'::jsonb,          -- Tab 2
-  procedures        jsonb not null default '[]'::jsonb,          -- Tab 3
-  final_diagnosis   text[] not null default '{}',                -- Tab 4
-  actions           jsonb not null default '[]'::jsonb,          -- Tab 5
-  created_by        uuid references public.profiles(id),
-  created_at        timestamptz not null default now(),
-  updated_at        timestamptz not null default now()
+  case_type text check (case_type in ('OB','Gyne')),
+  high_risk boolean default false,
+  consultants jsonb default '[]'::jsonb,  -- array of {id,name} from Directory (multi-add)
+  residents jsonb default '[]'::jsonb,    -- array of {id,name} from Directory (multi-add)
+  ob_reasons jsonb default '[]'::jsonb,   -- multi-add
+  gyne_reasons jsonb default '[]'::jsonb, -- multi-add
+  family_planning text,
+  procedures jsonb default '[]'::jsonb,
+  final_diagnosis jsonb default '[]'::jsonb,
+  actions jsonb default '[]'::jsonb,
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
+create index if not exists opd_date_idx on public.opd (consultation_date desc);
+create index if not exists opd_patient_idx on public.opd (patient_id);
 
-create index if not exists idx_opd_patient on public.opd_visits(patient_id);
-create index if not exists idx_opd_date on public.opd_visits(consultation_date);
-
--- ----------------------------------------------------------------------------
--- 6. TASKS  (Tasks Module)
--- ----------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 7. TASKS
+-- ---------------------------------------------------------------------------
 create table if not exists public.tasks (
-  id                uuid primary key default gen_random_uuid(),
-  module             text not null, -- which module this task pertains to
-  task_text          text not null,
-  assigned_to        uuid references public.profiles(id),
-  due_date           date,
-  status             text not null default 'Pending' check (status in ('Pending','In-Process','Completed')),
-  acknowledged       boolean not null default false,
-  completion_notes   text,
-  created_by         uuid references public.profiles(id),
-  created_at         timestamptz not null default now(),
-  updated_at         timestamptz not null default now()
+  id uuid primary key default gen_random_uuid(),
+  assigned_to uuid references public.profiles(id),
+  module text,        -- which module the task refers to (OPD, Cases, Wards, etc)
+  task text,
+  due_date date,
+  status text default 'Pending' check (status in ('Pending','Acknowledged','In-Process','Completed')),
+  completion_notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
+create index if not exists tasks_assigned_idx on public.tasks (assigned_to);
 
-create index if not exists idx_tasks_assigned on public.tasks(assigned_to);
-create index if not exists idx_tasks_module on public.tasks(module);
-
--- ----------------------------------------------------------------------------
--- 7. DIRECTORY  (Directory Module)
--- ----------------------------------------------------------------------------
-create table if not exists public.directory_contacts (
-  id                  uuid primary key default gen_random_uuid(),
-  last_name           text not null,
-  first_name          text not null,
-  middle_name         text,
-  gender              text check (gender in ('Male','Female')),
-  rank                text,
-  department          text,
-  designation         text,
-  contact_number      text,
-  email               text,
-  address             text,
-  birthdate           date,
-  emergency_contact_name    text,
-  emergency_contact_number  text,
-  created_by          uuid references public.profiles(id),
-  created_at          timestamptz not null default now(),
-  updated_at          timestamptz not null default now()
-);
-
-create index if not exists idx_directory_lastname on public.directory_contacts(last_name);
-
--- ----------------------------------------------------------------------------
--- 8. ACTIVITY LOGS  (Activity Logs Module) — append-only audit trail
--- ----------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 8. ACTIVITY LOGS
+-- ---------------------------------------------------------------------------
 create table if not exists public.activity_logs (
-  id            bigint generated always as identity primary key,
-  user_id       uuid references public.profiles(id),
-  module        text not null,
-  action        text not null,       -- e.g. 'create','update','delete','approve','login'
-  record_id     text,
-  old_data      jsonb,
-  new_data      jsonb,
-  created_at    timestamptz not null default now()
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id),
+  module text,
+  activity text,
+  old_value jsonb,
+  new_value jsonb,
+  created_at timestamptz default now()
 );
-
-create index if not exists idx_activity_module on public.activity_logs(module);
-create index if not exists idx_activity_created on public.activity_logs(created_at desc);
-create index if not exists idx_activity_user on public.activity_logs(user_id);
-
--- ----------------------------------------------------------------------------
--- 9. WARDS  (placeholder table — module explicitly "to follow upon next update")
--- ----------------------------------------------------------------------------
-create table if not exists public.wards (
-  id            uuid primary key default gen_random_uuid(),
-  name          text not null,
-  notes         text,
-  created_at    timestamptz not null default now()
-);
-comment on table public.wards is 'TASK: TO BE UPDATED — Wards Module structure not yet specified. Placeholder only.';
+create index if not exists activity_logs_module_idx on public.activity_logs (module);
+create index if not exists activity_logs_created_idx on public.activity_logs (created_at desc);
 
 -- ============================================================================
--- TRIGGERS — updated_at auto-touch
+-- TRIGGERS
 -- ============================================================================
-create or replace function public.touch_updated_at()
-returns trigger language plpgsql as $$
+
+-- updated_at helper
+create or replace function public.set_updated_at() returns trigger as $$
 begin
   new.updated_at = now();
   return new;
 end;
-$$;
+$$ language plpgsql;
 
-do $$
-declare t text;
-begin
-  foreach t in array array['profiles','patients','cases','opd_visits','tasks','directory_contacts']
-  loop
-    execute format('drop trigger if exists trg_touch_updated_at on public.%I;', t);
-    execute format('create trigger trg_touch_updated_at before update on public.%I for each row execute function public.touch_updated_at();', t);
-  end loop;
-end $$;
+drop trigger if exists trg_profiles_updated on public.profiles;
+create trigger trg_profiles_updated before update on public.profiles
+  for each row execute function public.set_updated_at();
+drop trigger if exists trg_directory_updated on public.directory;
+create trigger trg_directory_updated before update on public.directory
+  for each row execute function public.set_updated_at();
+drop trigger if exists trg_patients_updated on public.patients;
+create trigger trg_patients_updated before update on public.patients
+  for each row execute function public.set_updated_at();
+drop trigger if exists trg_cases_updated on public.cases;
+create trigger trg_cases_updated before update on public.cases
+  for each row execute function public.set_updated_at();
+drop trigger if exists trg_opd_updated on public.opd;
+create trigger trg_opd_updated before update on public.opd
+  for each row execute function public.set_updated_at();
+drop trigger if exists trg_tasks_updated on public.tasks;
+create trigger trg_tasks_updated before update on public.tasks
+  for each row execute function public.set_updated_at();
 
--- Auto-create a profile row (unapproved) whenever someone signs up
-create or replace function public.handle_new_user()
-returns trigger language plpgsql security definer as $$
+-- Auto-create a Pending profile row whenever someone signs up via Supabase Auth
+create or replace function public.handle_new_auth_user() returns trigger as $$
 begin
-  insert into public.profiles (id, email, last_name, first_name, middle_name, gender,
-    designation, rank, department, address, contact_number, birthdate)
-  values (
-    new.id, new.email,
-    coalesce(new.raw_user_meta_data->>'last_name',''),
-    coalesce(new.raw_user_meta_data->>'first_name',''),
-    new.raw_user_meta_data->>'middle_name',
-    new.raw_user_meta_data->>'gender',
-    new.raw_user_meta_data->>'designation',
-    new.raw_user_meta_data->>'rank',
-    new.raw_user_meta_data->>'department',
-    new.raw_user_meta_data->>'address',
-    new.raw_user_meta_data->>'contact_number',
-    nullif(new.raw_user_meta_data->>'birthdate','')::date
-  )
+  insert into public.profiles (id, email)
+  values (new.id, new.email)
   on conflict (id) do nothing;
   return new;
 end;
-$$;
+$$ language plpgsql security definer;
 
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
+drop trigger if exists trg_on_auth_user_created on auth.users;
+create trigger trg_on_auth_user_created
   after insert on auth.users
-  for each row execute function public.handle_new_user();
+  for each row execute function public.handle_new_auth_user();
+
+-- "Registered Users automatically registered to Directory"
+-- Whenever a profile is approved (status = 'Approved'), upsert it into Directory.
+create or replace function public.sync_profile_to_directory() returns trigger as $$
+begin
+  if new.status = 'Approved' then
+    insert into public.directory (
+      profile_id, last_name, first_name, middle_name, gender, rank,
+      department, designation, contact_number, email, address, birthdate,
+      is_doctor
+    ) values (
+      new.id, new.last_name, new.first_name, new.middle_name, new.gender, new.rank,
+      new.department, new.designation, new.contact_number, new.email, new.address, new.birthdate,
+      (new.designation in ('OB-Surgeon','OB-Doctor'))
+    )
+    on conflict (profile_id) do update set
+      last_name = excluded.last_name,
+      first_name = excluded.first_name,
+      middle_name = excluded.middle_name,
+      gender = excluded.gender,
+      rank = excluded.rank,
+      department = excluded.department,
+      designation = excluded.designation,
+      contact_number = excluded.contact_number,
+      email = excluded.email,
+      address = excluded.address,
+      birthdate = excluded.birthdate,
+      is_doctor = excluded.is_doctor,
+      updated_at = now();
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer;
+
+-- profile_id must be unique so the upsert above (on conflict) works
+create unique index if not exists directory_profile_id_uidx on public.directory (profile_id) where profile_id is not null;
+
+drop trigger if exists trg_sync_profile_to_directory on public.profiles;
+create trigger trg_sync_profile_to_directory
+  after insert or update of status, last_name, first_name, middle_name, gender, rank,
+    department, designation, contact_number, address, birthdate
+  on public.profiles
+  for each row execute function public.sync_profile_to_directory();
+
+-- Auto case number generator: CASE-YYYY-000001
+create or replace function public.set_case_no() returns trigger as $$
+begin
+  if new.case_no is null then
+    new.case_no := 'CASE-' || to_char(now(),'YYYY') || '-' || lpad(nextval('public.case_no_seq')::text,6,'0');
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_set_case_no on public.cases;
+create trigger trg_set_case_no before insert on public.cases
+  for each row execute function public.set_case_no();
 
 -- ============================================================================
--- HELPER FUNCTIONS FOR RLS (SECURITY DEFINER — read profile without recursion)
+-- ROW LEVEL SECURITY  (demo-friendly: any authenticated + approved user may
+-- read/write; only Admin/Chief Resident may delete or approve users. Tighten
+-- further per real deployment / when migrating to a stricter platform.)
 -- ============================================================================
-create or replace function public.current_profile()
-returns public.profiles language sql stable security definer set search_path = public as $$
-  select * from public.profiles where id = auth.uid();
-$$;
+alter table public.legends enable row level security;
+alter table public.profiles enable row level security;
+alter table public.directory enable row level security;
+alter table public.patients enable row level security;
+alter table public.cases enable row level security;
+alter table public.opd enable row level security;
+alter table public.tasks enable row level security;
+alter table public.activity_logs enable row level security;
 
-create or replace function public.is_approved()
-returns boolean language sql stable security definer set search_path = public as $$
-  select coalesce((select approved from public.profiles where id = auth.uid()), false);
-$$;
-
-create or replace function public.is_admin()
-returns boolean language sql stable security definer set search_path = public as $$
-  select coalesce((select user_level = 'Admin' and approved from public.profiles where id = auth.uid()), false);
-$$;
-
-create or replace function public.is_admin_or_chief()
-returns boolean language sql stable security definer set search_path = public as $$
-  select coalesce((select user_level in ('Admin','Chief Resident') and approved from public.profiles where id = auth.uid()), false);
-$$;
-
-create or replace function public.has_module_access(module_key text)
-returns boolean language sql stable security definer set search_path = public as $$
-  select coalesce(
-    (select approved and (user_level = 'Admin' or (access_control->>module_key)::boolean is true)
-     from public.profiles where id = auth.uid()),
-    false
+create or replace function public.is_admin() returns boolean as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and user_level in ('Admin','Chief Resident') and status = 'Approved'
   );
-$$;
+$$ language sql security definer stable;
 
--- ============================================================================
--- ROW LEVEL SECURITY
--- ============================================================================
-alter table public.profiles           enable row level security;
-alter table public.legend_options     enable row level security;
-alter table public.patients           enable row level security;
-alter table public.cases              enable row level security;
-alter table public.opd_visits         enable row level security;
-alter table public.tasks              enable row level security;
-alter table public.directory_contacts enable row level security;
-alter table public.activity_logs      enable row level security;
-alter table public.wards              enable row level security;
+create or replace function public.is_approved() returns boolean as $$
+  select exists (
+    select 1 from public.profiles where id = auth.uid() and status = 'Approved'
+  );
+$$ language sql security definer stable;
 
--- PROFILES ------------------------------------------------------------------
+-- profiles: user can see/update own row; approved users can see all (Users module list);
+-- only admin can update others / approve / change user_level.
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles for select
-  using (auth.uid() = id or public.is_admin() or public.has_module_access('users'));
+  using (auth.uid() = id or public.is_approved());
 
-drop policy if exists profiles_insert_self on public.profiles;
-create policy profiles_insert_self on public.profiles for insert
+drop policy if exists profiles_insert on public.profiles;
+create policy profiles_insert on public.profiles for insert
   with check (auth.uid() = id);
 
-drop policy if exists profiles_update on public.profiles;
-create policy profiles_update on public.profiles for update
-  using (auth.uid() = id or public.is_admin())
-  with check (
-    auth.uid() = id and (select approved from public.profiles where id = auth.uid()) is not distinct from approved
-    or public.is_admin()
-  );
+drop policy if exists profiles_update_self on public.profiles;
+create policy profiles_update_self on public.profiles for update
+  using (auth.uid() = id or public.is_admin());
 
-drop policy if exists profiles_delete on public.profiles;
-create policy profiles_delete on public.profiles for delete
+drop policy if exists profiles_delete_admin on public.profiles;
+create policy profiles_delete_admin on public.profiles for delete
   using (public.is_admin());
 
--- LEGEND_OPTIONS --------------------------------------------------------------
-drop policy if exists legend_select on public.legend_options;
-create policy legend_select on public.legend_options for select
-  using (public.is_approved());
-
-drop policy if exists legend_write on public.legend_options;
-create policy legend_write on public.legend_options for insert
-  with check (public.has_module_access('legends'));
-drop policy if exists legend_update on public.legend_options;
-create policy legend_update on public.legend_options for update
-  using (public.has_module_access('legends'));
-drop policy if exists legend_delete on public.legend_options;
-create policy legend_delete on public.legend_options for delete
-  using (public.has_module_access('legends'));
-
--- Generic pattern applied to the clinical/operational tables -----------------
--- SELECT: any approved user with module access. INSERT: same, stamped as
--- created_by = auth.uid(). UPDATE: module access holders; DELETE: Admin only
--- (spec: delete buttons are Admin-only across every module).
-
--- PATIENTS
-drop policy if exists patients_select on public.patients;
-create policy patients_select on public.patients for select using (public.has_module_access('patient_record'));
-drop policy if exists patients_insert on public.patients;
-create policy patients_insert on public.patients for insert with check (public.has_module_access('patient_record') and created_by = auth.uid());
-drop policy if exists patients_update on public.patients;
-create policy patients_update on public.patients for update using (public.has_module_access('patient_record'));
-drop policy if exists patients_delete on public.patients;
-create policy patients_delete on public.patients for delete using (public.is_admin());
-
--- CASES (edits after creation flagged for approval are still allowed to write,
--- the app enforces the "needs_admin_approval" workflow at the application layer)
-drop policy if exists cases_select on public.cases;
-create policy cases_select on public.cases for select using (public.has_module_access('cases'));
-drop policy if exists cases_insert on public.cases;
-create policy cases_insert on public.cases for insert with check (public.has_module_access('cases') and created_by = auth.uid());
-drop policy if exists cases_update on public.cases;
-create policy cases_update on public.cases for update using (public.has_module_access('cases'));
-drop policy if exists cases_delete on public.cases;
-create policy cases_delete on public.cases for delete using (public.is_admin());
-
--- OPD
-drop policy if exists opd_select on public.opd_visits;
-create policy opd_select on public.opd_visits for select using (public.has_module_access('opd'));
-drop policy if exists opd_insert on public.opd_visits;
-create policy opd_insert on public.opd_visits for insert with check (public.has_module_access('opd') and created_by = auth.uid());
-drop policy if exists opd_update on public.opd_visits;
-create policy opd_update on public.opd_visits for update using (public.has_module_access('opd'));
-drop policy if exists opd_delete on public.opd_visits;
-create policy opd_delete on public.opd_visits for delete using (public.is_admin());
-
--- TASKS (assignee or creator or admin can see/update; anyone with tasks access can create)
-drop policy if exists tasks_select on public.tasks;
-create policy tasks_select on public.tasks for select using (public.has_module_access('tasks'));
-drop policy if exists tasks_insert on public.tasks;
-create policy tasks_insert on public.tasks for insert with check (public.has_module_access('tasks') and created_by = auth.uid());
-drop policy if exists tasks_update on public.tasks;
-create policy tasks_update on public.tasks for update using (public.has_module_access('tasks') and (assigned_to = auth.uid() or created_by = auth.uid() or public.is_admin()));
-drop policy if exists tasks_delete on public.tasks;
-create policy tasks_delete on public.tasks for delete using (public.is_admin());
-
--- DIRECTORY
-drop policy if exists directory_select on public.directory_contacts;
-create policy directory_select on public.directory_contacts for select using (public.has_module_access('directory'));
-drop policy if exists directory_insert on public.directory_contacts;
-create policy directory_insert on public.directory_contacts for insert with check (public.has_module_access('directory') and created_by = auth.uid());
-drop policy if exists directory_update on public.directory_contacts;
-create policy directory_update on public.directory_contacts for update using (public.has_module_access('directory'));
-drop policy if exists directory_delete on public.directory_contacts;
-create policy directory_delete on public.directory_contacts for delete using (public.is_admin());
-
--- ACTIVITY LOGS (insert by any approved user for their own actions; read
--- restricted to those with activity_logs access; no update/delete — audit trail is immutable)
-drop policy if exists activity_select on public.activity_logs;
-create policy activity_select on public.activity_logs for select using (public.has_module_access('activity_logs'));
-drop policy if exists activity_insert on public.activity_logs;
-create policy activity_insert on public.activity_logs for insert with check (public.is_approved() and user_id = auth.uid());
-
--- WARDS (placeholder — read-only to any approved user for now)
-drop policy if exists wards_select on public.wards;
-create policy wards_select on public.wards for select using (public.is_approved());
+-- Generic policy shape for the rest: approved users can select/insert/update,
+-- only admin can delete.
+do $$
+declare t text;
+begin
+  foreach t in array array['legends','directory','patients','cases','opd','tasks','activity_logs'] loop
+    execute format('drop policy if exists %I_select on public.%I;', t, t);
+    execute format('create policy %I_select on public.%I for select using (public.is_approved());', t, t);
+    execute format('drop policy if exists %I_insert on public.%I;', t, t);
+    execute format('create policy %I_insert on public.%I for insert with check (public.is_approved());', t, t);
+    execute format('drop policy if exists %I_update on public.%I;', t, t);
+    execute format('create policy %I_update on public.%I for update using (public.is_approved());', t, t);
+    execute format('drop policy if exists %I_delete on public.%I;', t, t);
+    execute format('create policy %I_delete on public.%I for delete using (public.is_admin());', t, t);
+  end loop;
+end $$;
 
 -- ============================================================================
--- SEED: default legend_options from the spec's Definitions section
+-- SEED DATA — Legends (from the AFP_VLUNA spec)
 -- ============================================================================
-insert into public.legend_options (category, value, sort_order) values
+insert into public.legends (category, value, sort_order) values
 -- Rank
 ('rank','OFF',1),('rank','ENS',2),('rank','ODW',3),('rank','ODD',4),('rank','ODM',5),
 ('rank','EDW',6),('rank','EDD',7),('rank','EDM',8),('rank','CIV',9),('rank','CIV/P',10),
@@ -470,9 +396,9 @@ insert into public.legend_options (category, value, sort_order) values
 ('rank','MSGT',36),('rank','LTC',37),('rank','CAFGU',38),('rank','PMA CDT',39),
 -- BOS
 ('bos','PA',1),('bos','PAF',2),('bos','PN',3),('bos','PN(M)',4),('bos','TAS',5),('bos','CHR',6),
--- PC (Patient Category)
+-- PC
 ('pc','MIL',1),('pc','DEP',2),('pc','CIV/E',3),('pc','CIV/P',4),
--- PS (Patient Status)
+-- PS
 ('ps','Admitted',1),('ps','Discharged',2),('ps','Deceased',3),('ps','Non-Admitted',4),
 -- User Level
 ('user_level','Admin',1),('user_level','Chief Resident',2),('user_level','Resident',3),
@@ -489,38 +415,28 @@ insert into public.legend_options (category, value, sort_order) values
 ('department','Physical & Rehabilitation Medicine',14),
 -- Designation
 ('designation','OB-Surgeon',1),('designation','OB-Doctor',2),
--- Comorbidity (category::subcategory encoded in value with " — " separator for grouping in UI)
-('comorbidity','Cardiovascular — Hypertension (High blood pressure)',1),
-('comorbidity','Cardiovascular — Congestive Heart Failure (CHF)',2),
-('comorbidity','Cardiovascular — Coronary Artery Disease (CAD)',3),
-('comorbidity','Cardiovascular — Peripheral Vascular Disease (PVD)',4),
-('comorbidity','Cardiovascular — Cardiac arrhythmias',5),
-('comorbidity','Respiratory — Chronic Obstructive Pulmonary Disease (COPD)',6),
-('comorbidity','Respiratory — Asthma moderate',7),
-('comorbidity','Respiratory — Asthma severe',8),
-('comorbidity','Respiratory — Chronic respiratory failure or oxygen dependence',9),
-('comorbidity','Endocrine & Metabolic — Diabetes Mellitus Type 1',10),
-('comorbidity','Endocrine & Metabolic — Diabetes Mellitus Type 2',11),
-('comorbidity','Endocrine & Metabolic — Diabetes Mellitus with chronic complications',12),
-('comorbidity','Endocrine & Metabolic — Diabetes Mellitus without chronic complications',13),
-('comorbidity','Endocrine & Metabolic — Hypothyroidism',14),
-('comorbidity','Endocrine & Metabolic — Obesity Class 1 (Moderate: 30-34.9 BMI)',15),
-('comorbidity','Endocrine & Metabolic — Obesity Class 2 (Severe: 35.0-39.9 BMI)',16),
-('comorbidity','Endocrine & Metabolic — Obesity Class 3 (Morbid: 40.0 above BMI)',17),
-('comorbidity','Neurological & Psychiatric — Cerebrovascular Disease',18),
-('comorbidity','Neurological & Psychiatric — Dementia or Alzheimer''s Disease',19),
-('comorbidity','Neurological & Psychiatric — Chronic depression',20),
-('comorbidity','Neurological & Psychiatric — Parkinson''s disease or multiple sclerosis',21),
-('comorbidity','Renal & Hepatic — Chronic Kidney Disease (CKD)',22),
-('comorbidity','Renal & Hepatic — Cirrhosis or chronic hepatitis / liver failure',23),
-('comorbidity','Oncology & Immunology — Solid tumors / Cancer localized',24),
-('comorbidity','Oncology & Immunology — Solid tumors / Cancer undergoing treatment',25),
-('comorbidity','Oncology & Immunology — Solid tumors / Cancer metastatic',26),
-('comorbidity','Oncology & Immunology — Leukemia, lymphoma or multiple myeloma',27),
-('comorbidity','Oncology & Immunology — HIV / AIDS',28),
-('comorbidity','Oncology & Immunology — Rheumatologic/autoimmune disease',29),
-('comorbidity','Gastrointestinal System — Peptic ulcer disease',30),
-('comorbidity','Gastrointestinal System — Inflammatory Bowel Disease',31),
+-- Comorbidity
+('comorbidity','Hypertension (High blood pressure)',1),('comorbidity','Congestive Heart Failure (CHF)',2),
+('comorbidity','Coronary Artery Disease (CAD)',3),('comorbidity','Peripheral Vascular Disease (PVD)',4),
+('comorbidity','Cardiac arrhythmias',5),('comorbidity','Chronic Obstructive Pulmonary Disease (COPD)',6),
+('comorbidity','Asthma moderate',7),('comorbidity','Asthma severe',8),
+('comorbidity','Chronic respiratory failure or oxygen dependence',9),
+('comorbidity','Diabetes Mellitus Type 1',10),('comorbidity','Diabetes Mellitus Type 2',11),
+('comorbidity','Diabetes Mellitus with chronic complications',12),
+('comorbidity','Diabetes Mellitus without chronic complications',13),('comorbidity','Hypothyroidism',14),
+('comorbidity','Obesity Class 1 (Moderate: 30-34.9 BMI)',15),
+('comorbidity','Obesity Class 2 (Severe: 35.0-39.9 BMI)',16),
+('comorbidity','Obesity Class 3 (Morbid: 40.0 above BMI)',17),
+('comorbidity','Cerebrovascular Disease',18),('comorbidity','Dementia or Alzheimer''s Disease',19),
+('comorbidity','Chronic depression',20),('comorbidity','Parkinson''s disease or multiple sclerosis',21),
+('comorbidity','Chronic Kidney Disease (CKD)',22),
+('comorbidity','Cirrhosis or chronic hepatitis / liver failure',23),
+('comorbidity','Solid tumors / Cancer localized',24),
+('comorbidity','Solid tumors / Cancer undergoing treatment',25),
+('comorbidity','Solid tumors / Cancer metastatic',26),
+('comorbidity','Leukemia, lymphoma or multiple myeloma',27),('comorbidity','HIV / AIDS',28),
+('comorbidity','Rheumatologic/autoimmune disease',29),('comorbidity','Peptic ulcer disease',30),
+('comorbidity','Inflammatory Bowel Disease',31),
 -- OB-GYNE Admission Reason
 ('ob_admission_reason','Labor and delivery',1),('ob_admission_reason','High-Risk Pregnancy',2),
 ('ob_admission_reason','Cancer (for chemotherapy)',3),('ob_admission_reason','Abnormal Uterine Bleeding',4),
@@ -537,6 +453,51 @@ insert into public.legend_options (category, value, sort_order) values
 ('evac_from','Fernando Air Base Hospital',7),('evac_from','Fort Magsaysay',8),
 ('evac_from','Camp Nakar',9),('evac_from','Camp Capinpin',10),
 ('evac_from','Naval Station Ernesto Ogbinar',11),('evac_from','FSRR',12),
+-- OB-GYN Procedures
+('ob_gyn_procedure','Spontaneous Vaginal Delivery',1),
+('ob_gyn_procedure','Assisted Vaginal Delivery (Forceps/Vacuum)',2),
+('ob_gyn_procedure','Completion curettage',3),('ob_gyn_procedure','Dilatation and curettage',4),
+('ob_gyn_procedure','Endometrial Biopsy',5),('ob_gyn_procedure','Cervical Biopsy',6),
+('ob_gyn_procedure','Suction Curettage',7),('ob_gyn_procedure','Cesarean Delivery',8),
+('ob_gyn_procedure','Primary CS',9),('ob_gyn_procedure','Repeat CS',10),
+('ob_gyn_procedure','Repeat CS w/ BTL',11),('ob_gyn_procedure','Hysterectomy',12),
+('ob_gyn_procedure','Adnexal Surgery',13),('ob_gyn_procedure','Myomectomy',14),
+('ob_gyn_procedure','Vaginal Hysterectomy',15),('ob_gyn_procedure','TAHBS',16),
+('ob_gyn_procedure','TAHBSO',17),('ob_gyn_procedure','EHBSO',18),('ob_gyn_procedure','RHBSO',19),
+('ob_gyn_procedure','Unilateral Oophoro-Cystectomy',20),
+('ob_gyn_procedure','Bilateral Oophorocystectomy',21),
+('ob_gyn_procedure','Unilateral Oophorectomy',22),('ob_gyn_procedure','Bilateral Oophorectomy',23),
+('ob_gyn_procedure','Unilateral Salpingo-Oophorectomy',24),
+('ob_gyn_procedure','Bilateral Salpingo-oophorecotmy',25),
+('ob_gyn_procedure','Unilateral Salpingectomy',26),('ob_gyn_procedure','Bilateral Salpingectomy',27),
+('ob_gyn_procedure','Hysteroscopic Guided Endometrial Biopsy',28),
+('ob_gyn_procedure','Electrocautery',29),('ob_gyn_procedure','Hysteroscopic guided polypectomy',30),
+('ob_gyn_procedure','Laparoscopic Salpingectomy',31),('ob_gyn_procedure','Unilateral fimbriectomy',32),
+('ob_gyn_procedure','Hysteroscopic guided IUD removal',33),
+('ob_gyn_procedure','EL Salpingophorectomy Right with Frozen section and Total Abdominal Hysterectomy with Salpingectomy Left with Adhesiolysis',34),
+('ob_gyn_procedure','EL, PFC, Extrafascial Hysterectomy with Bilateral Salpingoophorectomy, Vaginectomy with BLND, PALS under SAB/CEA converted to GA',35),
+('ob_gyn_procedure','LEEP',36),('ob_gyn_procedure','Cervical Polypectomy',37),
+('ob_gyn_procedure','Colposcopy',38),
+('ob_gyn_procedure','Evacuation of Hematoma, Ligation of bleeders, and Repair of Perineal Laceration',39),
+('ob_gyn_procedure','Excision of perineal granulation tissue',40),
+('ob_gyn_procedure','Enterolysis, Adhesiolysis, TAH',41),
+('ob_gyn_procedure','Bilateral Oophorocystectomy with excision of Paratubal Cyst, Right',42),
+('ob_gyn_procedure','Resection of septum Diagnostic Laparoscopy, chromopertubation',43),
+('ob_gyn_procedure','Endometrial curettage',44),
+('ob_gyn_procedure','EL, Evacuation of Hemoperitoneum, Salpingectomy, Left under Spinal anesthesia',45),
+-- Indication for Primary CS
+('indication_primary_cs','NRFHRP',1),('indication_primary_cs','Fetal Malpresentation',2),
+('indication_primary_cs','Failed Induction of labor',3),
+('indication_primary_cs','Preeclampsia with severe features - uncontrolled',4),
+('indication_primary_cs','Arrest in cervical Dilation',5),
+('indication_primary_cs','Prolonged Second Stage',6),
+('indication_primary_cs','Prolonged Deceleration Phase',7),
+('indication_primary_cs','Abnormal Placentation',8),
+('indication_primary_cs','Cephalopelvic Disproportion',9),
+('indication_primary_cs','Deteriorating Fetal Status',10),('indication_primary_cs','Placenta previa',11),
+('indication_primary_cs','Oligohydramnios',12),('indication_primary_cs','Poor Bishop Score',13),
+('indication_primary_cs','Non inducible cervix',14),('indication_primary_cs','Failure in Descent',15),
+('indication_primary_cs','Arrest in Descent',16),
 -- Discharge Status
 ('discharge_status','RETURN TO DUTY',1),('discharge_status','RETRO EVAC',2),('discharge_status','THOC',3),
 ('discharge_status','HOME',4),('discharge_status','HAMA',5),('discharge_status','TOS',6),
@@ -560,61 +521,30 @@ insert into public.legend_options (category, value, sort_order) values
 ('gyne_reason','MYOMA UTERI',19),('gyne_reason','t/c BARTHOLIN CYST',20),
 ('gyne_reason','LABIAL ADHESION',21),('gyne_reason','t/c APAS',22),
 -- OB OPD Procedures
-('ob_opd_procedures','PAP SMEAR',1),('ob_opd_procedures','VIA',2),('ob_opd_procedures','COLPOSCOPY',3),
-('ob_opd_procedures','OFFICE ENDOMETRIAL BIOPSY',4),('ob_opd_procedures','CERVICAL PUNCH BIOPSY',5),
-('ob_opd_procedures','HYSTEROGRAM',6),
+('ob_opd_procedure','PAP SMEAR',1),('ob_opd_procedure','VIA',2),('ob_opd_procedure','COLPOSCOPY',3),
+('ob_opd_procedure','OFFICE ENDOMETRIAL BIOPSY',4),('ob_opd_procedure','CERVICAL PUNCH BIOPSY',5),
+('ob_opd_procedure','HYSTEROGRAM',6),
 -- Family Planning
 ('family_planning','BTL',1),('family_planning','CS WITH BTL',2),('family_planning','IUD',3),
 ('family_planning','PILLS',4),('family_planning','DMPA',5),('family_planning','IMPLANT',6),
 ('family_planning','CONTEMPLATING',7),('family_planning','NONE',8),
--- OB-GYN Procedures (Minor/Major not pre-classified here — Admin can tag via Legends UI note)
-('ob_gyn_procedures','Spontaneous Vaginal Delivery',1),
-('ob_gyn_procedures','Assisted Vaginal Delivery (Forceps/Vacuum)',2),
-('ob_gyn_procedures','Completion curettage',3),('ob_gyn_procedures','Dilatation and curettage',4),
-('ob_gyn_procedures','Endometrial Biopsy',5),('ob_gyn_procedures','Cervical Biopsy',6),
-('ob_gyn_procedures','Suction Curettage',7),('ob_gyn_procedures','Cesarean Delivery',8),
-('ob_gyn_procedures','Primary CS',9),('ob_gyn_procedures','Repeat CS',10),
-('ob_gyn_procedures','Repeat CS w/ BTL',11),('ob_gyn_procedures','Hysterectomy',12),
-('ob_gyn_procedures','Adnexal Surgery',13),('ob_gyn_procedures','Myomectomy',14),
-('ob_gyn_procedures','Vaginal Hysterectomy',15),('ob_gyn_procedures','TAHBS',16),
-('ob_gyn_procedures','TAHBSO',17),('ob_gyn_procedures','EHBSO',18),('ob_gyn_procedures','RHBSO',19),
-('ob_gyn_procedures','Unilateral Oophoro-Cystectomy',20),
-('ob_gyn_procedures','Bilateral Oophorocystectomy',21),
-('ob_gyn_procedures','Unilateral Oophorectomy',22),('ob_gyn_procedures','Bilateral Oophorectomy',23),
-('ob_gyn_procedures','Unilateral Salpingo-Oophorectomy',24),
-('ob_gyn_procedures','Bilateral Salpingo-oophorectomy',25),
-('ob_gyn_procedures','Unilateral Salpingectomy',26),('ob_gyn_procedures','Bilateral Salpingectomy',27),
-('ob_gyn_procedures','Hysteroscopic Guided Endometrial Biopsy',28),
-('ob_gyn_procedures','Electrocautery',29),('ob_gyn_procedures','Hysteroscopic guided polypectomy',30),
-('ob_gyn_procedures','Laparoscopic Salpingectomy',31),('ob_gyn_procedures','Unilateral fimbriectomy',32),
-('ob_gyn_procedures','Hysteroscopic guided IUD removal',33),
-('ob_gyn_procedures','LEEP',34),('ob_gyn_procedures','Cervical Polypectomy',35),
-('ob_gyn_procedures','Colposcopy',36),
-('ob_gyn_procedures','Evacuation of Hematoma, Ligation of bleeders, and Repair of Perineal Laceration',37),
-('ob_gyn_procedures','Excision of perineal granulation tissue',38),
-('ob_gyn_procedures','Enterolysis, Adhesiolysis, TAH',39),
-('ob_gyn_procedures','Resection of septum Diagnostic Laparoscopy, chromopertubation',40),
-('ob_gyn_procedures','Endometrial curettage',41),
--- Indication for Primary CS
-('indication_primary_cs','NRFHRP',1),('indication_primary_cs','Fetal Malpresentation',2),
-('indication_primary_cs','Failed Induction of labor',3),
-('indication_primary_cs','Preeclampsia with severe features - uncontrolled',4),
-('indication_primary_cs','Arrest in cervical Dilation',5),
-('indication_primary_cs','Prolonged Second Stage',6),
-('indication_primary_cs','Prolonged Deceleration Phase',7),
-('indication_primary_cs','Abnormal Placentation',8),
-('indication_primary_cs','Cephalopelvic Disproportion',9),
-('indication_primary_cs','Deteriorating Fetal Status',10),
-('indication_primary_cs','Placenta previa',11),('indication_primary_cs','Oligohydramnios',12),
-('indication_primary_cs','Poor Bishop Score',13),('indication_primary_cs','Non inducible cervix',14),
-('indication_primary_cs','Failure in Descent',15),('indication_primary_cs','Arrest in Descent',16)
-on conflict (category, value) do nothing;
+-- Registration Status (OPD)
+('registration_status','Registered',1),('registration_status','Not-Registered',2),
+('registration_status','New',3),('registration_status','Old',4),
+-- Access modules (for Access Control checklist)
+('access_module','OPD',1),('access_module','Overview',2),('access_module','Directory',3),
+('access_module','Cases',4),('access_module','Legends',5),('access_module','Activity Logs',6),
+('access_module','Users',7),('access_module','Tasks',8),('access_module','Wards',9),
+('access_module','Patient Record',10)
+on conflict (category, lower(value)) do nothing;
 
 -- ============================================================================
--- AFTER RUNNING THIS FILE:
---   1. Sign up your first user through the app's Sign-up form.
---   2. In the SQL editor, run:
---        update public.profiles set user_level = 'Admin', approved = true
---        where email = 'your-admin-email@example.com';
---   3. Log back in — you'll now see the Users module and can approve others.
+-- OPTIONAL: create your first Admin account
+-- 1) Sign up normally through the app's Sign Up form first.
+-- 2) Then run this (replace the email) to approve yourself as Admin:
+--
+-- update public.profiles
+--   set user_level = 'Admin', status = 'Approved',
+--       access_control = '["OPD","Overview","Directory","Cases","Legends","Activity Logs","Users","Tasks","Wards","Patient Record"]'
+--   where email = 'youremail@example.com';
 -- ============================================================================
