@@ -1,75 +1,104 @@
 # AFP-VLUNA — single-file build
 
 `index.html` is the entire app — CSS, all JS modules, and the AFP-VLUNA
-seal (embedded as base64) are all inlined into one file. Nothing else to
-upload or host alongside it; just open it in a browser, or deploy it as-is
-to Vercel/Cloudflare Pages/any static host/a USB stick.
+seal (embedded as base64) are inlined into one file. Open it directly in a
+browser, or deploy it as-is to Vercel/Cloudflare Pages/any static host.
 
-The only external dependencies are three CDN `<script>` tags for Chart.js,
-jsPDF, and the Supabase client library — same as before, just no longer
-split across local `css/` and `js/` files.
+The only external dependencies are three CDN `<script>` tags (Chart.js,
+jsPDF, the Supabase client library) — everything else is in this one file.
 
-Demo login: `admin@afp-vluna.mil.ph` / `Admin@2026`
-(Chief Resident: `chief.resident@afp-vluna.mil.ph` / `Chief@2026`)
+Demo login (works immediately, no setup): `admin@afp-vluna.mil.ph` / `Admin@2026`
 
 ## What changed in this update
 
-- **AFP-VLUNA seal** now used throughout (sidebar, login page, browser tab
-  favicon) in place of the placeholder text crest.
-- **Mobile-friendly**: sidebar becomes a slide-out drawer with a hamburger
-  toggle and dimmed backdrop below ~860px width; topbar, grids, forms,
-  modals, and tables all reflow to single-column / full-width / horizontally
-  scrollable as needed. Same color palette and layout on desktop — nothing
-  about the look was changed, only how it adapts to a small screen.
-- **Login/Signup** — Designation is now a proper department-wide dropdown
-  (Consultant, Department Head, Physician, Surgeon, Nurse, etc., not just
-  the two OB-GYN-specific options), so people signing up for other
-  departments have something correct to pick.
-- **Users → Directory auto-sync** — every registered user (on signup, and
-  whenever their profile is edited from the Users module) is automatically
-  mirrored into the Directory. Directory now always contains "all the Users
-  in the Users tab," tagged **🔒 System User** and kept in sync; manually
-  added contacts (outside referrals, emergency contacts) stay independent
-  and fully editable/deletable.
-- **OPD module** — Consultant in-charge, Resident in-charge, and OB/GYNE
-  Reason are now all "+ Add" pickers you can use repeatedly to build a list
-  (consultants/residents pulled from Directory), instead of a single select
-  each.
-- **Cases module** —
-  - Fixed the OB-GYN Procedures dropdown overflow that pushed the add-buttons
-    off-screen (the picker row now wraps and the select is width-constrained
-    instead of stretching past the modal).
-  - Indication for Primary CS and Surgeon are now "+ Add" pickers supporting
-    multiple entries each (Surgeon pulled from Directory), instead of a
-    single select each.
-- **Tasks module** — full rebuild: assign a task to a specific user (not
-  just a role), with Module / Task / Due Date. Tasks are clickable to open
-  a detail view with a running **Actions / Progress Notes** log (your
-  "completion form"), plus an **Acknowledge** button (open → in-process) and
-  a **Mark Complete** button.
+- Removed "OB-GYN Department" from the login page's title — it now just
+  reads "AFP Health Surveillance & Records System". (The browser tab title
+  still says "...— OB-GYN Department" since that wasn't part of the ask —
+  say the word if you want that changed too.)
+- **Real, tested Supabase integration** — this is the big one, see below.
 
-## Supabase
+## Setting up your Supabase backend
 
-`supabase-schema.sql` is updated to match all of the above (directory sync
-column, multi-value jsonb columns for OPD/Cases/Tasks, task status +
-actions log) and includes role-based Row Level Security policies for every
-table.
+**1. Create the project and run the schema.**
+Create a Supabase project, open the SQL Editor, paste the entire contents
+of `supabase-schema.sql`, and run it once.
 
-**Read the "AUTH" note at the bottom of that file before relying on the
-RLS policies** — they're keyed to Supabase Auth (`auth.uid()`), but the
-app's Login module currently does its own custom email/password check
-against the `users` table rather than calling Supabase Auth. The policies
-are correct and ready, but won't actually take effect until the two small
-changes described there are made to the Login module's signup/login calls.
-Until then, treat the SQL file as "the schema and policies to have ready,"
-not yet enforced — same security posture the demo already has with
-`DB_MODE: "local"`.
+This file has been **verified against a real PostgreSQL instance** (not
+just eyeballed) — every `CREATE TABLE`/`CREATE POLICY`/trigger statement
+ran clean, and I behavior-tested the actual RLS policies end-to-end using
+Supabase's real role/auth model (a mocked `auth.uid()` + non-superuser
+`authenticated` role, exactly how Supabase's own API access works):
+confirmed pending users can read their own profile but nothing else,
+confirmed a regular user cannot self-promote to Admin by calling the API
+directly (a privilege-escalation trigger blocks it), confirmed Staff-level
+users can create records but not delete them, and confirmed the bootstrap
+step below actually works.
 
-To use it: create a Supabase project, paste `supabase-schema.sql` into the
-SQL Editor and run it, then in `index.html` find the `APP_CONFIG` block near
-the top of the inlined script and set `DB_MODE: "supabase"` with your
-project URL/anon key. The `DB` object's `local` branch is the only thing
-that then needs to be swapped for the Supabase calls sketched in the
-comment block right after it — every module already calls
-`DB.insert/update/get/query/remove` exclusively, so that's the only edit
-needed anywhere in the file.
+**2. Turn off email confirmation** (recommended for this app).
+In your Supabase project: Authentication → Providers → Email → turn off
+"Confirm email." The app already has its own Admin-approval gate for new
+signups, so a second confirm-your-email gate is redundant friction — and
+without it, your first signup can finish setting up immediately instead of
+waiting on a confirmation link.
+
+**3. Point the app at your project.**
+Open `index.html` in a text editor, find `APP_CONFIG` near the top of the
+inlined script, and set:
+```js
+DB_MODE: "supabase",
+SUPABASE_URL: "https://YOUR-PROJECT.supabase.co",
+SUPABASE_ANON_KEY: "YOUR-ANON-KEY",
+```
+Both values are in your Supabase project under Settings → API. Save, and
+open (or redeploy) `index.html`.
+
+## Making yourself an Admin account
+
+There's no Admin yet to approve the first signup, so it's a one-time manual
+step:
+
+1. Open the app (now pointed at your Supabase project) and click **Sign
+   up**. Fill in your real details and submit. You'll land on a "pending
+   approval" screen — expected, ignore it for now.
+2. Go back to the Supabase SQL Editor and run (with your own email):
+   ```sql
+   update public.users
+      set status = 'approved', user_level = 'Admin'
+    where email = 'you@example.com';
+   ```
+   This exact statement is also sitting at the bottom of
+   `supabase-schema.sql`, commented out, ready to uncomment and edit.
+3. Go back to the app and sign in (or just click Sign In if you're still on
+   that screen) — you're now an approved Admin. From here on, approve
+   everyone else's accounts normally from the Users module — no more manual
+   SQL needed after this one bootstrap step.
+
+## How the security actually works (read this once)
+
+- Every table has Row Level Security enabled. Nobody gets data back from
+  the API unless a policy explicitly allows it — there's no default-open
+  table.
+- **Approved users** can read/write clinical records (patients, cases,
+  OPD). **Admin or Chief Resident** are required to delete records, approve
+  accounts, or manage Legends. **Only Admin** can delete a user account
+  outright.
+- A **pending user can always read their own profile row** (needed so the
+  app can show them the "waiting for approval" screen) but nothing else
+  until approved.
+- A regular signed-in user **cannot** grant themselves Admin, approve
+  themselves, or flip their own `access_opd` flag by calling the Supabase
+  API directly, even bypassing the app's UI entirely — a database trigger
+  blocks any change to `status`/`user_level`/`access_opd` unless the caller
+  is already Admin/Chief Resident, or the request has no end-user session
+  attached at all (i.e. it's coming from you, in the SQL Editor — which is
+  exactly what makes the one-time bootstrap step above work).
+
+## Multi-user behavior
+
+Reads are served from an in-memory cache hydrated from Supabase on login
+and on manual refresh (the ⟳ Refresh button in the top bar), not a live
+subscription — so if two people are using it at the same time, each sees
+the other's changes after they hit Refresh, not instantly. Writes are
+optimistic (your own screen updates immediately) and sync to Supabase in
+the background; if a sync fails (e.g. you're offline), you'll get a toast
+telling you so rather than the change silently vanishing.

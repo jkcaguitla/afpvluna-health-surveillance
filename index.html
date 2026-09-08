@@ -416,21 +416,14 @@ select{ max-width:100%; }
 
 const APP_CONFIG = {
   DB_MODE: "supabase", // "local" | "supabase"
-  // NOTE: only Auth (sign up / sign in / session) is wired to Supabase so
-  // far — see db.js's Auth object. Patients, cases, OPD, directory, tasks,
-  // legends, and activity_logs are still read/written via localStorage
-  // regardless of this flag, because DB.all/insert/update/remove/query
-  // haven't been converted to the async Supabase engine yet. That's the
-  // next migration step; the SUPABASE MIGRATION SKETCH near the bottom of
-  // db.js sketches out that seam.
 
-  SUPABASE_URL: "https://dsiegilttequwinpvklm.supabase.co",
-  SUPABASE_ANON_KEY: "sb_publishable_znbsQtVltSY_uPTUGl1Kmg_yhcBJeot",
+  SUPABASE_URL: "https://vlngjgyuzqupmvfpxcdn.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_qTJEp3Zt0LOM2y3Fh4jO5w_k3wCgrhX",
 
   TIMEZONE: "Asia/Manila", // Philippine Standard Time, UTC+8, no DST
 
   APP_NAME: "AFP-VLUNA",
-  APP_FULL_NAME: "AFP Health Surveillance & Records — OB-GYN Department",
+  APP_FULL_NAME: "AFP Health Surveillance & Records System",
   DEMO_MODE_BANNER: true
 };
 
@@ -683,33 +676,53 @@ const LEGENDS_SEED = {
  * -----------------------------------------------------------------------
  * ALL data access for the whole app goes through the DB object below.
  * No module (users.js, cases.js, opd.js, ...) touches localStorage or
- * Supabase directly — this is the ONE seam to change when migrating.
+ * Supabase directly — this is the ONE seam that changes with DB_MODE.
  *
  * Tables (mirrors /supabase/schema.sql):
  *   users, patients, cases, opd_visits, directory, tasks,
  *   activity_logs, legends
  *
- * Every write goes through DB.insert/update/remove, which also appends
- * an activity_logs row — so Activity Logs and the "recent activity"
- * widgets on every module are automatically populated, everywhere,
- * with zero extra code in the feature modules.
+ * ARCHITECTURE — why reads stay synchronous even in "supabase" mode:
+ * Every module in this app reads data synchronously (e.g. `DB.all("cases")`
+ * used inline while building an HTML string). Supabase is a network API,
+ * which is asynchronous by nature — so making every read async would mean
+ * rewriting every render() function in every module to be async/await, and
+ * `legendOptions()` (called dozens of times per module, inline inside
+ * template literals) would need the same treatment. That's a much bigger,
+ * riskier change than the data layer itself.
+ *
+ * Instead, this file keeps an in-memory CACHE that mirrors the same shape
+ * localStorage used. In "local" mode, the cache *is* localStorage (read
+ * straight through). In "supabase" mode:
+ *   - DB.init() hydrates the cache from Supabase once (call this before
+ *     the first route(), and again after login/signup and on manual
+ *     Refresh — see app.js).
+ *   - Reads (all/get/query) are synchronous reads of the cache — instant,
+ *     no network round-trip, exactly like local mode.
+ *   - Writes (insert/update/remove) update the cache immediately
+ *     (optimistic, so the UI reacts instantly) AND fire the matching
+ *     Supabase call in the background. If the network write fails, a
+ *     toast tells the person and the change stays local-only until they
+ *     retry — it does not silently disappear.
+ * This is a write-through cache with periodic/manual re-hydration, not
+ * true realtime sync — two people editing the exact same record at the
+ * exact same moment can still race. For this app's scale (tens of staff,
+ * not a high-concurrency system) that trade-off is the right one; a fuller
+ * realtime subscription can be layered on later via
+ * supabase.channel(...).on('postgres_changes', ...) without touching any
+ * module file, since it would just call the same cache-merge helpers below.
  * -----------------------------------------------------------------------
  */
 
 const DB = (() => {
   const LS_PREFIX = "afpvluna_";
-  const TABLES = ["users","patients","cases","opd_visits","directory","tasks","activity_logs","legends","session"];
+  const TABLES = ["users","patients","cases","opd_visits","directory","tasks","activity_logs","legends"];
 
-  // ---- local (localStorage) engine -------------------------------------
-  function lsKey(table) { return LS_PREFIX + table; }
-
-  function lsRead(table) {
-    try { return JSON.parse(localStorage.getItem(lsKey(table))) || []; }
-    catch { return []; }
-  }
-  function lsWrite(table, rows) {
-    localStorage.setItem(lsKey(table), JSON.stringify(rows));
-  }
+  function mode() { return APP_CONFIG.DB_MODE; } // read live (not cached) so it always reflects config.js
+  let sbClient = null;
+  let cache = {}; // supabase-mode in-memory mirror: { patients: [...], cases: [...], ... }
+  TABLES.forEach(t => cache[t] = []);
+  let hydrated = false;
 
   function uid() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -718,110 +731,80 @@ const DB = (() => {
     });
   }
 
-  // ---- Supabase client (auth only, for now) ------------------------------
-  // Everything else in this file still runs against localStorage (DB_MODE
-  // stays "local" for reads/writes elsewhere in the app — see the note in
-  // the SUPABASE MIGRATION SKETCH near the bottom of this file). Auth is
-  // wired up for real, though: when DB_MODE is "supabase", sign-in/sign-up
-  // create real Supabase Auth users and a matching public.users row with
-  // auth_uid set, so the RLS policies in schema.sql actually take effect
-  // once the rest of the CRUD layer is migrated.
-  let _supa = null;
-  function supa() {
-    if (!_supa) {
-      if (typeof supabase === "undefined") {
-        throw new Error("Supabase client library not loaded (check the CDN script tag).");
-      }
-      _supa = supabase.createClient(APP_CONFIG.SUPABASE_URL, APP_CONFIG.SUPABASE_ANON_KEY);
-    }
-    return _supa;
+  // ---- local (localStorage) engine -------------------------------------
+  function lsKey(table) { return LS_PREFIX + table; }
+  function lsRead(table) {
+    try { return JSON.parse(localStorage.getItem(lsKey(table))) || []; }
+    catch { return []; }
+  }
+  function lsWrite(table, rows) {
+    localStorage.setItem(lsKey(table), JSON.stringify(rows));
   }
 
-  // ---- Auth (real Supabase Auth when DB_MODE === "supabase") ------------
-  const Auth = {
-    // Creates a real Supabase Auth account. The matching public.users
-    // profile row is created automatically by a database trigger (see
-    // AFP-VLUNA-auth-fix.sql — it fires on auth.users insert and runs with
-    // elevated privileges, so it doesn't need or wait on an RLS-governed
-    // client insert). Returns { profile, needsConfirmation }: profile is
-    // null when the project has "Confirm email" turned on, since no
-    // session (and therefore no readable row) exists until the user
-    // confirms.
-    async signUp(email, password, profile) {
-      const sb = supa();
-      const { data, error } = await sb.auth.signUp({
-        email, password,
-        options: { data: profile } // -> auth.users.raw_user_meta_data, read by the trigger
-      });
-      if (error) throw error;
+  // ---- table read/write that both modes funnel through ------------------
+  function readTable(table) {
+    return mode() === "supabase" ? cache[table] : lsRead(table);
+  }
+  function writeTable(table, rows) {
+    if (mode() === "supabase") cache[table] = rows;
+    else lsWrite(table, rows);
+  }
 
-      if (!data.session) {
-        // Email confirmation required — no session yet, so the profile
-        // row (created by the trigger) isn't readable by this client
-        // until after confirmation + login.
-        return { profile: null, needsConfirmation: true };
+  // ---- Supabase client (lazy — only created if DB_MODE is "supabase") ---
+  function getClient() {
+    if (!sbClient) {
+      if (typeof supabase === "undefined" || !supabase.createClient) {
+        throw new Error("Supabase client library did not load (check the CDN script tag / network).");
       }
-
-      const { data: row, error: rowErr } = await sb
-        .from("users").select("*").eq("auth_uid", data.user.id).single();
-      if (rowErr) throw rowErr;
-      return { profile: row, needsConfirmation: false };
-    },
-
-    // Signs in via Supabase Auth, then loads the matching public.users
-    // profile row (matched by auth_uid) for the app-level session.
-    async signIn(email, password) {
-      const sb = supa();
-      const { data, error } = await sb.auth.signInWithPassword({ email, password });
-      if (error) throw error;
-      const authUid = data.user?.id;
-      const { data: profile, error: profileErr } = await sb
-        .from("users").select("*").eq("auth_uid", authUid).single();
-      if (profileErr) throw profileErr;
-      return profile;
-    },
-
-    async signOut() {
-      const sb = supa();
-      const { error } = await sb.auth.signOut();
-      if (error) throw error;
-    },
-
-    // Restores a session on page load (e.g. after refresh) from Supabase's
-    // own persisted auth token, re-fetching the matching profile row.
-    async restoreSession() {
-      const sb = supa();
-      const { data, error } = await sb.auth.getSession();
-      if (error || !data.session) return null;
-      const authUid = data.session.user.id;
-      const { data: profile, error: profileErr } = await sb
-        .from("users").select("*").eq("auth_uid", authUid).single();
-      if (profileErr) return null;
-      return profile;
+      sbClient = supabase.createClient(APP_CONFIG.SUPABASE_URL, APP_CONFIG.SUPABASE_ANON_KEY);
     }
-  };
+    return sbClient;
+  }
 
-  // ---- public API (local implementation) --------------------------------
+  // ---- public API ---------------------------------------------------
   const api = {
-    mode: APP_CONFIG.DB_MODE,
+    get mode() { return mode(); },
+    isHydrated() { return hydrated; },
+
+    getSupabaseClient() { return getClient(); },
+
+    // Pull every table from Supabase into the in-memory cache. Call this
+    // before the first route() in "supabase" mode, and again after
+    // login/signup (RLS means logged-out reads of protected tables come
+    // back empty) and whenever the person hits the topbar Refresh button.
+    async init() {
+      if (mode() !== "supabase") { hydrated = true; return; }
+      const client = getClient();
+      await Promise.all(TABLES.map(async (t) => {
+        const { data, error } = await client.from(t).select("*").order("created_at", { ascending: false });
+        if (error) { console.error("Hydrate failed for", t, error.message); return; }
+        cache[t] = data || [];
+      }));
+      hydrated = true;
+    },
 
     all(table) {
-      return lsRead(table);
+      return readTable(table);
     },
 
     get(table, id) {
-      return lsRead(table).find(r => r.id === id) || null;
+      return readTable(table).find(r => r.id === id) || null;
     },
 
     query(table, predicate) {
-      return lsRead(table).filter(predicate);
+      return readTable(table).filter(predicate);
     },
 
     insert(table, row, actor = null) {
-      const rows = lsRead(table);
+      const rows = readTable(table);
       const rec = { id: uid(), created_at: nowISO(), updated_at: nowISO(), ...row };
       rows.push(rec);
-      lsWrite(table, rows);
+      writeTable(table, rows);
+      if (mode() === "supabase") {
+        getClient().from(table).insert(rec).then(({ error }) => {
+          if (error) toast(`Sync error saving to ${table}: ${error.message}`);
+        });
+      }
       if (table !== "activity_logs") {
         this._log(table, rec.id, "create", actor, null, rec);
       }
@@ -829,23 +812,34 @@ const DB = (() => {
     },
 
     update(table, id, patch, actor = null) {
-      const rows = lsRead(table);
+      const rows = readTable(table);
       const idx = rows.findIndex(r => r.id === id);
       if (idx === -1) return null;
       const before = { ...rows[idx] };
-      rows[idx] = { ...rows[idx], ...patch, updated_at: nowISO() };
-      lsWrite(table, rows);
-      if (table !== "activity_logs") {
-        this._log(table, id, "update", actor, before, rows[idx]);
+      const after = { ...rows[idx], ...patch, updated_at: nowISO() };
+      rows[idx] = after;
+      writeTable(table, rows);
+      if (mode() === "supabase") {
+        getClient().from(table).update(patch).eq("id", id).then(({ error }) => {
+          if (error) toast(`Sync error updating ${table}: ${error.message}`);
+        });
       }
-      return rows[idx];
+      if (table !== "activity_logs") {
+        this._log(table, id, "update", actor, before, after);
+      }
+      return after;
     },
 
     remove(table, id, actor = null) {
-      const rows = lsRead(table);
+      const rows = readTable(table);
       const before = rows.find(r => r.id === id);
       const next = rows.filter(r => r.id !== id);
-      lsWrite(table, next);
+      writeTable(table, next);
+      if (mode() === "supabase") {
+        getClient().from(table).delete().eq("id", id).then(({ error }) => {
+          if (error) toast(`Sync error deleting from ${table}: ${error.message}`);
+        });
+      }
       if (table !== "activity_logs" && before) {
         this._log(table, id, "delete", actor, before, null);
       }
@@ -853,8 +847,8 @@ const DB = (() => {
     },
 
     _log(module, recordId, action, actor, before, after) {
-      const rows = lsRead("activity_logs");
-      rows.unshift({
+      const rows = readTable("activity_logs");
+      const rec = {
         id: uid(),
         created_at: nowISO(),
         module, record_id: recordId, action,
@@ -862,11 +856,20 @@ const DB = (() => {
         actor_name: actor ? `${actor.first_name} ${actor.last_name}` : "System",
         before: before ? JSON.stringify(before) : null,
         after: after ? JSON.stringify(after) : null
-      });
-      lsWrite("activity_logs", rows.slice(0, 5000)); // cap demo log size
+      };
+      rows.unshift(rec);
+      writeTable("activity_logs", mode() === "supabase" ? rows : rows.slice(0, 5000)); // cap only matters for local demo storage
+      if (mode() === "supabase") {
+        getClient().from("activity_logs").insert(rec).then(({ error }) => {
+          if (error) console.error("Activity log sync failed:", error.message);
+        });
+      }
     },
 
     // ---- session helpers --------------------------------------------
+    // "local" mode: full profile stored directly (matches the demo's custom
+    // login check). "supabase" mode: same shape, just sourced from the
+    // `users` row matched to the Supabase Auth session — see login.js.
     getSession() {
       try { return JSON.parse(localStorage.getItem(lsKey("session"))); } catch { return null; }
     },
@@ -897,19 +900,23 @@ const DB = (() => {
     },
 
     // ---- first-run seeding --------------------------------------------
+    // Legends (dropdown definitions) are essential reference data the app
+    // needs to function at all, so they're seeded in BOTH modes if missing.
+    // Demo users/patients/tasks are seeded ONLY in local mode — a real
+    // Supabase-backed deployment shouldn't get fake accounts and patients
+    // planted in it automatically. In supabase mode, your first real
+    // account comes from Signup; see the README for how to promote it to
+    // Admin the first time (there's no admin yet to approve it).
     seedIfEmpty() {
       if (this.all("legends").length === 0) {
-        const legendRows = [];
         for (const [key, val] of Object.entries(LEGENDS_SEED)) {
-          legendRows.push({ id: uid(), created_at: nowISO(), updated_at: nowISO(), category: key, data: val });
+          this.insert("legends", { category: key, data: val });
         }
-        lsWrite("legends", legendRows);
       }
 
-      // Demo local-account seeding only makes sense in "local" mode — in
-      // "supabase" mode, real accounts are created via Auth.signUp() /
-      // your own Supabase dashboard instead, so this whole block is skipped.
-      if (APP_CONFIG.DB_MODE === "local" && this.all("users").length === 0) {
+      if (mode() !== "local") return;
+
+      if (this.all("users").length === 0) {
         const admin = {
           id: uid(), created_at: nowISO(), updated_at: nowISO(),
           email: "admin@afp-vluna.mil.ph",
@@ -965,11 +972,6 @@ const DB = (() => {
         demoPatients.forEach(p => this.insert("patients", p));
       }
 
-      // Note: Directory is no longer separately seeded here — every seeded
-      // user above is auto-synced into it via syncUserToDirectory(). Emergency
-      // contact fields for those two can still be filled in from the
-      // Directory module (Edit) any time; they're just not pre-filled here.
-
       if (this.all("tasks").length === 0) {
         const chiefUser = this.query("users", u => u.email === "chief.resident@afp-vluna.mil.ph")[0];
         const adminUser = this.query("users", u => u.email === "admin@afp-vluna.mil.ph")[0];
@@ -983,41 +985,22 @@ const DB = (() => {
     }
   };
 
-  api.auth = Auth;
   return api;
 })();
 
-/*
- * -----------------------------------------------------------------------
- * SUPABASE MIGRATION SKETCH (kept here for whoever flips DB_MODE later)
- * -----------------------------------------------------------------------
- * const sb = supabase.createClient(APP_CONFIG.SUPABASE_URL, APP_CONFIG.SUPABASE_ANON_KEY);
- *
- * async function all(table) {
- *   const { data, error } = await sb.from(table).select("*");
- *   if (error) throw error; return data;
- * }
- * async function insert(table, row, actor) {
- *   const { data, error } = await sb.from(table).insert(row).select().single();
- *   if (error) throw error;
- *   await sb.from("activity_logs").insert({ module: table, record_id: data.id,
- *     action: "create", actor_id: actor?.id, after: data });
- *   return data;
- * }
- * // ...update/remove follow the same shape. Because every module calls
- * // DB.insert/DB.update/DB.all/DB.query/DB.remove (never localStorage
- * // directly), swapping this block is the ONLY change needed app-wide.
- * -----------------------------------------------------------------------
- */
-
 
 // ==== js/modules/login.js ====
-/** modules/login.js — Login page module (auth screen, signup, pending-approval gate) */
+/** modules/login.js — Login page module (auth screen, signup, pending-approval gate)
+ * In "local" mode: custom check against the `users` table (demo behaviour, unchanged).
+ * In "supabase" mode: real Supabase Auth (signUp / signInWithPassword), with the
+ * `users` row looked up/created via `auth_uid` — see the AUTH note in schema.sql.
+ */
 const ModuleLogin = (() => {
 
   function passwordValid(pw) {
     return /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/.test(pw);
   }
+  const isSupabase = () => APP_CONFIG.DB_MODE === "supabase";
 
   function render(root) {
     root.innerHTML = `
@@ -1038,16 +1021,13 @@ const ModuleLogin = (() => {
               <label>Password</label>
               <input type="password" id="loginPassword" required placeholder="********">
             </div>
-            <button type="submit" class="btn btn-primary">Sign In</button>
+            <button type="submit" class="btn btn-primary" id="loginSubmitBtn">Sign In</button>
           </form>
           <div class="login-switch">Don't have an account? <a id="goSignup">Sign up</a></div>
-          ${APP_CONFIG.DB_MODE === "local" ? `
+          ${isSupabase() ? "" : `
           <div class="mt-16 muted" style="font-size:11.5px; text-align:center;">
             Demo accounts &mdash; Admin: admin@afp-vluna.mil.ph / Admin@2026<br>
             Chief Resident: chief.resident@afp-vluna.mil.ph / Chief@2026
-          </div>` : `
-          <div class="mt-16 muted" style="font-size:11.5px; text-align:center;">
-            Sign up below to create an account, then ask an Admin to approve it.
           </div>`}
         </div>
       </div>`;
@@ -1058,27 +1038,53 @@ const ModuleLogin = (() => {
       const email = document.getElementById("loginEmail").value.trim().toLowerCase();
       const pw = document.getElementById("loginPassword").value;
       const alertBox = document.getElementById("loginAlert");
-      const submitBtn = e.target.querySelector("button[type=submit]");
+      const btn = document.getElementById("loginSubmitBtn");
 
-      let user;
-      if (APP_CONFIG.DB_MODE === "supabase") {
-        submitBtn.disabled = true;
+      if (isSupabase()) {
+        btn.disabled = true; btn.textContent = "Signing in...";
         try {
-          user = await DB.auth.signIn(email, pw);
+          const client = DB.getSupabaseClient();
+          const { data, error } = await client.auth.signInWithPassword({ email, password: pw });
+          if (error) { alertBox.innerHTML = `<div class="login-alert error">${esc(error.message)}</div>`; return; }
+          await DB.init(); // re-hydrate now that we're authenticated (RLS opens up)
+          let userRow = DB.query("users", u => u.auth_uid === data.user.id)[0];
+          if (!userRow) {
+            // First successful login after an email-confirmation signup — the
+            // profile row wasn't created yet (see renderSignup). Create it now
+            // from what was saved locally at signup time, if we still have it.
+            const pendingRaw = sessionStorage.getItem("afpvluna_pending_profile");
+            if (pendingRaw) {
+              const pending = JSON.parse(pendingRaw);
+              if (pending.email === email) {
+                userRow = DB.insert("users", { ...pending, auth_uid: data.user.id });
+                DB.syncUserToDirectory(userRow, userRow);
+                sessionStorage.removeItem("afpvluna_pending_profile");
+              }
+            }
+          }
+          if (!userRow) {
+            alertBox.innerHTML = `<div class="login-alert error">Signed in, but no matching profile was found in the users table. Contact your Admin.</div>`;
+            return;
+          }
+          DB.setSession(userRow);
+          if (userRow.status !== "approved") { renderPendingScreen(document.getElementById("root")); return; }
+          DB._log("users", userRow.id, "login", userRow, null, null);
+          location.hash = "#/overview";
+          route();
         } catch (err) {
-          alertBox.innerHTML = `<div class="login-alert error">${esc(err.message || "Invalid username or password.")}</div>`;
-          submitBtn.disabled = false;
-          return;
+          alertBox.innerHTML = `<div class="login-alert error">${esc(err.message)}</div>`;
+        } finally {
+          btn.disabled = false; btn.textContent = "Sign In";
         }
-        submitBtn.disabled = false;
-      } else {
-        user = DB.query("users", u => u.email.toLowerCase() === email && u.password === pw)[0];
-        if (!user) {
-          alertBox.innerHTML = `<div class="login-alert error">Invalid username or password.</div>`;
-          return;
-        }
+        return;
       }
 
+      // ---- local demo auth (unchanged) ----
+      const user = DB.query("users", u => u.email.toLowerCase() === email && u.password === pw)[0];
+      if (!user) {
+        alertBox.innerHTML = `<div class="login-alert error">Invalid username or password.</div>`;
+        return;
+      }
       if (user.status === "pending") {
         DB.setSession(user);
         renderPendingScreen(document.getElementById("root"));
@@ -1120,7 +1126,7 @@ const ModuleLogin = (() => {
               <div class="field"><label>Birthdate</label><input type="date" id="su_bd" required></div>
               <div class="field"><label>Age</label><input type="text" id="su_age" disabled placeholder="auto"></div>
             </div>
-            <button type="submit" class="btn btn-primary mt-16" style="width:100%; justify-content:center;">Create Account</button>
+            <button type="submit" class="btn btn-primary mt-16" id="signupSubmitBtn" style="width:100%; justify-content:center;">Create Account</button>
           </form>
           <div class="login-switch">Already have an account? <a id="backToLogin">Sign in</a></div>
         </div>
@@ -1134,10 +1140,10 @@ const ModuleLogin = (() => {
     document.getElementById("signupForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const alertBox = document.getElementById("signupAlert");
+      const btn = document.getElementById("signupSubmitBtn");
       const pw = document.getElementById("su_pw").value;
       const pw2 = document.getElementById("su_pw2").value;
       const email = document.getElementById("su_email").value.trim().toLowerCase();
-      const submitBtn = e.target.querySelector("button[type=submit]");
 
       if (!passwordValid(pw)) {
         alertBox.innerHTML = `<div class="login-alert error">Password must be 8+ characters with letters, at least one number and one symbol.</div>`;
@@ -1148,7 +1154,8 @@ const ModuleLogin = (() => {
         return;
       }
 
-      const profile = {
+      const profileFields = {
+        email,
         last_name: document.getElementById("su_ln").value,
         first_name: document.getElementById("su_fn").value,
         middle_name: document.getElementById("su_mn").value,
@@ -1158,55 +1165,45 @@ const ModuleLogin = (() => {
         department: document.getElementById("su_dept").value,
         address: document.getElementById("su_addr").value,
         contact_number: document.getElementById("su_contact").value,
-        birthdate: document.getElementById("su_bd").value
+        birthdate: document.getElementById("su_bd").value,
+        user_level: "Staff",
+        status: "pending",
+        access_opd: false
       };
 
-      let rec, needsConfirmation = false;
-      if (APP_CONFIG.DB_MODE === "supabase") {
-        submitBtn.disabled = true;
+      if (isSupabase()) {
+        btn.disabled = true; btn.textContent = "Creating account...";
         try {
-          const result = await DB.auth.signUp(email, pw, profile);
-          rec = result.profile;
-          needsConfirmation = result.needsConfirmation;
+          const client = DB.getSupabaseClient();
+          const { data, error } = await client.auth.signUp({ email, password: pw });
+          if (error) { alertBox.innerHTML = `<div class="login-alert error">${esc(error.message)}</div>`; return; }
+          if (!data.session) {
+            // Email confirmation is enabled on this Supabase project — no active
+            // session yet, so we can't insert the profile row (RLS requires
+            // auth_uid = auth.uid()). Tell the person to confirm, then sign in
+            // normally — the profile gets created on their first successful login.
+            alertBox.innerHTML = `<div class="login-alert info">Account created. Check your email to confirm it, then sign in — your profile will finish setting up automatically on first sign-in.</div>`;
+            sessionStorage.setItem("afpvluna_pending_profile", JSON.stringify(profileFields));
+            return;
+          }
+          const rec = DB.insert("users", { ...profileFields, auth_uid: data.user.id });
+          DB.syncUserToDirectory(rec, rec);
+          DB.setSession(rec);
+          renderPendingScreen(document.getElementById("root"));
         } catch (err) {
-          alertBox.innerHTML = `<div class="login-alert error">${esc(err.message || "Could not create account.")}</div>`;
-          submitBtn.disabled = false;
-          return;
+          alertBox.innerHTML = `<div class="login-alert error">${esc(err.message)}</div>`;
+        } finally {
+          btn.disabled = false; btn.textContent = "Create Account";
         }
-        submitBtn.disabled = false;
-      } else {
-        if (DB.query("users", u => u.email.toLowerCase() === email).length) {
-          alertBox.innerHTML = `<div class="login-alert error">An account with this email already exists.</div>`;
-          return;
-        }
-        rec = DB.insert("users", {
-          email, password: pw,
-          ...profile,
-          user_level: "Staff",
-          status: "pending",
-          access_opd: false
-        });
-      }
-
-      if (needsConfirmation) {
-        // No session yet (email confirmation required) — nothing to cache
-        // or sync to Directory until the user confirms and logs in.
-        root.innerHTML = `
-          <div class="login-wrap">
-            <div class="login-card">
-              <div class="login-brand">
-                <h1>Check your email</h1>
-                <p>We've sent a confirmation link to <b>${esc(email)}</b>. Confirm it, then sign in — an Admin will still need to approve your account before you get full access.</p>
-              </div>
-              <button class="btn btn-primary" id="backToLoginConfirm" style="width:100%; justify-content:center;">Back to Sign In</button>
-            </div>
-          </div>`;
-        document.getElementById("backToLoginConfirm").addEventListener("click", () => render(root));
         return;
       }
 
-      // Directory is still local-only for now (see the DB_MODE note at the
-      // top of db.js), so this mirrors the new profile into it either way.
+      // ---- local demo auth (unchanged) ----
+      if (DB.query("users", u => u.email.toLowerCase() === email).length) {
+        alertBox.innerHTML = `<div class="login-alert error">An account with this email already exists.</div>`;
+        return;
+      }
+      const rec = DB.insert("users", { ...profileFields, password: pw });
       DB.syncUserToDirectory(rec, rec);
       DB.setSession(rec);
       renderPendingScreen(document.getElementById("root"));
@@ -1230,8 +1227,7 @@ const ModuleLogin = (() => {
         </div>
       </div>`;
     document.getElementById("signOutPending").addEventListener("click", () => {
-      DB.clearSession();
-      render(root);
+      logoutUser();
     });
   }
 
@@ -3408,7 +3404,8 @@ function renderShell() {
             <div class="topbar-title" id="viewTitle">Overview</div>
           </div>
           <div class="topbar-right">
-            ${APP_CONFIG.DEMO_MODE_BANNER ? `<span class="demo-badge">DEMO / SUPABASE-READY</span>` : ""}
+            ${APP_CONFIG.DB_MODE === "supabase" ? `<span class="demo-badge" style="background:var(--teal-600);">LIVE &middot; SUPABASE</span>` : (APP_CONFIG.DEMO_MODE_BANNER ? `<span class="demo-badge">DEMO / SUPABASE-READY</span>` : "")}
+            <button class="icon-btn" id="signOutBtn" title="Sign out"><span>&#9211;</span><span class="label">Sign out</span></button>
             <div class="user-chip" id="userChip">
               <div class="user-avatar">${initials(user)}</div>
               <div>
@@ -3435,9 +3432,21 @@ function renderShell() {
   document.getElementById("sidebarToggle").addEventListener("click", () => {
     document.getElementById("sidebar").classList.toggle("collapsed");
   });
-  document.getElementById("refreshBtn").addEventListener("click", () => route());
+  document.getElementById("refreshBtn").addEventListener("click", async () => {
+    if (APP_CONFIG.DB_MODE === "supabase") {
+      const btn = document.getElementById("refreshBtn");
+      btn.disabled = true;
+      try { await DB.init(); toast("Synced latest from Supabase."); }
+      catch (e) { toast("Sync failed: " + e.message); }
+      btn.disabled = false;
+    }
+    route();
+  });
   document.getElementById("userChip").addEventListener("click", () => {
     ModuleUsers.openOwnProfile ? ModuleUsers.openOwnProfile() : null;
+  });
+  document.getElementById("signOutBtn").addEventListener("click", () => {
+    if (confirm("Sign out?")) logoutUser();
   });
 
   // Mobile off-canvas nav
@@ -3476,25 +3485,30 @@ function route() {
 
 window.addEventListener("hashchange", route);
 window.addEventListener("DOMContentLoaded", async () => {
-  DB.seedIfEmpty();
-  // In supabase mode, Supabase's own client persists the auth token across
-  // reloads — this re-hydrates our app-level session cache from it so the
-  // rest of the app (which reads DB.getSession() synchronously) keeps
-  // working unchanged. In local mode this is a no-op.
   if (APP_CONFIG.DB_MODE === "supabase") {
+    document.getElementById("root").innerHTML = `
+      <div class="login-wrap"><div class="login-card" style="text-align:center;">
+        <div class="login-brand"><div class="crest-lg"><img src="data:image/png;base64,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" alt=""></div>
+        <h1>Connecting to Supabase&hellip;</h1><p>Loading AFP-VLUNA</p></div>
+      </div></div>`;
     try {
-      const profile = await DB.auth.restoreSession();
-      if (profile) DB.setSession(profile);
+      await DB.init();
     } catch (e) {
-      console.warn("Could not restore Supabase session:", e);
+      document.getElementById("root").innerHTML = `
+        <div class="login-wrap"><div class="login-card">
+          <div class="login-alert error">Could not connect to Supabase: ${esc(e.message)}<br><br>
+          Check APP_CONFIG.SUPABASE_URL / SUPABASE_ANON_KEY, and that supabase/schema.sql has been run on your project.</div>
+        </div></div>`;
+      return;
     }
   }
+  DB.seedIfEmpty();
   route();
 });
 
-async function logoutUser() {
+function logoutUser() {
   if (APP_CONFIG.DB_MODE === "supabase") {
-    try { await DB.auth.signOut(); } catch (e) { console.warn("Supabase sign-out failed:", e); }
+    DB.getSupabaseClient().auth.signOut().catch(() => {});
   }
   DB.clearSession();
   location.hash = "";
