@@ -1,126 +1,105 @@
-# AFP-VLUNA — single-file build
+# AFP VLUNA — OB-GYN Health Surveillance & Record System (Demo Build)
 
-`index.html` is the entire app — CSS, all JS modules, and the AFP-VLUNA
-seal (embedded as base64) are inlined into one file. Open it directly in a
-browser, or deploy it as-is to Vercel/Cloudflare Pages/any static host.
+A single-file web app (`index.html`) for the Armed Forces of the Philippines
+OB-GYN Department, backed by Supabase for the demo. Built mobile-first.
 
-The only external dependencies are three CDN `<script>` tags (Chart.js,
-jsPDF, the Supabase client library) — everything else is in this one file.
+> **⚠️ This is a working demo scaffold, not a finished production system.**
+> It implements the full navigation, auth, database schema, and the core
+> workflows for every module in the spec. A few things are intentionally
+> left as **`TASK: TO BE UPDATED`** — search the code for that exact phrase
+> to find them all. See "What's Left" below.
 
-Demo login (works immediately, no setup): `admin@afp-vluna.mil.ph` / `Admin@2026`
+---
 
-## What changed in this update
+## 1. Deploy in ~10 minutes
 
-- Removed "OB-GYN Department" from the login page's title — it now just
-  reads "AFP Health Surveillance & Records System". (The browser tab title
-  still says "...— OB-GYN Department" since that wasn't part of the ask —
-  say the word if you want that changed too.)
-- Your live Supabase project (`vlngjgyuzqupmvfpxcdn`) and publishable key
-  are wired into `APP_CONFIG` — `DB_MODE` is now `"supabase"` by default.
-- **Fixed a real bug from first deploy:** the app was trying to seed the
-  `legends` dropdown data (Rank, BOS, Departments, etc.) from the browser on
-  every page load, which its own RLS policy correctly rejected since nobody
-  is logged in yet at that point — you'd have seen a wall of "Sync error
-  saving to legends: row violates row-level security policy" toasts. That
-  seeding now happens once via SQL instead (`supabase-legends-seed.sql`,
-  see setup step 1b below) and the app no longer attempts it client-side in
-  Supabase mode at all, so that error loop is gone for good, not just
-  silenced.
-
-## Setting up your Supabase backend
-
-**1. Create the project and run the schema.**
-Create a Supabase project, open the SQL Editor, paste the entire contents
-of `supabase-schema.sql`, and run it once.
-
-This file has been **verified against a real PostgreSQL instance** (not
-just eyeballed) — every `CREATE TABLE`/`CREATE POLICY`/trigger statement
-ran clean, and I behavior-tested the actual RLS policies end-to-end using
-Supabase's real role/auth model (a mocked `auth.uid()` + non-superuser
-`authenticated` role, exactly how Supabase's own API access works):
-confirmed pending users can read their own profile but nothing else,
-confirmed a regular user cannot self-promote to Admin by calling the API
-directly (a privilege-escalation trigger blocks it), confirmed Staff-level
-users can create records but not delete them, and confirmed the bootstrap
-step below actually works.
-
-**1b. Seed the dropdown reference data (Rank, BOS, Departments, etc.).**
-Also in the SQL Editor, paste and run `supabase-legends-seed.sql`. This has
-to be a separate SQL step rather than something the app does for itself on
-first load: the `legends` table's insert policy correctly requires
-Admin/Chief Resident, but nobody is logged in yet on a brand-new project —
-so seeding it from the browser would always get blocked by the very policy
-protecting it. (If you tried the app before this file existed and saw a wall
-of "Sync error saving to legends: new row violates row-level security
-policy" toasts, this is the fix — that loop is now gone entirely, since the
-app no longer attempts to seed legends client-side in Supabase mode at all.)
-Safe to re-run; it skips rows that already exist.
-
-**2. Turn off email confirmation** (recommended for this app).
-In your Supabase project: Authentication → Providers → Email → turn off
-"Confirm email." The app already has its own Admin-approval gate for new
-signups, so a second confirm-your-email gate is redundant friction — and
-without it, your first signup can finish setting up immediately instead of
-waiting on a confirmation link.
-
-**3. Point the app at your project.**
-Open `index.html` in a text editor, find `APP_CONFIG` near the top of the
-inlined script, and set:
-```js
-DB_MODE: "supabase",
-SUPABASE_URL: "https://YOUR-PROJECT.supabase.co",
-SUPABASE_ANON_KEY: "YOUR-ANON-KEY",
-```
-Both values are in your Supabase project under Settings → API. Save, and
-open (or redeploy) `index.html`.
-
-## Making yourself an Admin account
-
-There's no Admin yet to approve the first signup, so it's a one-time manual
-step:
-
-1. Open the app (now pointed at your Supabase project) and click **Sign
-   up**. Fill in your real details and submit. You'll land on a "pending
-   approval" screen — expected, ignore it for now.
-2. Go back to the Supabase SQL Editor and run (with your own email):
-   ```sql
-   update public.users
-      set status = 'approved', user_level = 'Admin'
-    where email = 'you@example.com';
+### A. Supabase (backend)
+1. Go to [supabase.com](https://supabase.com) → New Project (pick a region close to the Philippines, e.g. Singapore).
+2. Open **SQL Editor → New query**, paste the entire contents of `supabase_schema.sql`, click **Run**.
+3. Go to **Project Settings → API** and copy:
+   - `Project URL`
+   - `anon public` key
+4. Open `index.html`, find this block near the top of the `<script>` section (search `JS:CONFIG`):
+   ```js
+   const SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co";   // TASK: TO BE UPDATED
+   const SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";               // TASK: TO BE UPDATED
    ```
-   This exact statement is also sitting at the bottom of
-   `supabase-schema.sql`, commented out, ready to uncomment and edit.
-3. Go back to the app and sign in (or just click Sign In if you're still on
-   that screen) — you're now an approved Admin. From here on, approve
-   everyone else's accounts normally from the Users module — no more manual
-   SQL needed after this one bootstrap step.
+   Replace both with your real values and save.
+5. In **Authentication → Providers → Email**, turn **Confirm email OFF** for the demo (so new sign-ups can log in immediately, still gated by your Admin approval). Turn it back ON for production.
 
-## How the security actually works (read this once)
+### B. GitHub
+1. Create a new repository, e.g. `afp-vluna-obgyn`.
+2. Upload `index.html` (and this `README.md`, `supabase_schema.sql` for reference) to the repo root.
 
-- Every table has Row Level Security enabled. Nobody gets data back from
-  the API unless a policy explicitly allows it — there's no default-open
-  table.
-- **Approved users** can read/write clinical records (patients, cases,
-  OPD). **Admin or Chief Resident** are required to delete records, approve
-  accounts, or manage Legends. **Only Admin** can delete a user account
-  outright.
-- A **pending user can always read their own profile row** (needed so the
-  app can show them the "waiting for approval" screen) but nothing else
-  until approved.
-- A regular signed-in user **cannot** grant themselves Admin, approve
-  themselves, or flip their own `access_opd` flag by calling the Supabase
-  API directly, even bypassing the app's UI entirely — a database trigger
-  blocks any change to `status`/`user_level`/`access_opd` unless the caller
-  is already Admin/Chief Resident, or the request has no end-user session
-  attached at all (i.e. it's coming from you, in the SQL Editor — which is
-  exactly what makes the one-time bootstrap step above work).
+### C. Vercel or Cloudflare Pages (frontend hosting)
+- **Vercel:** New Project → Import your GitHub repo → Framework preset "Other" → Build command *empty* → Output directory `/` → Deploy.
+- **Cloudflare Pages:** Create a project → Connect to Git → your repo → Build command *empty* → Build output directory `/` → Deploy.
 
-## Multi-user behavior
+Either way, since this is a static single HTML file, no build step is required.
 
-Reads are served from an in-memory cache hydrated from Supabase on login
-and on manual refresh (the ⟳ Refresh button in the top bar), not a live
-subscription — so if two people are using it at the same time, each sees
-the other's changes after they hit Refresh, not instantly. Writes are
-optimistic (your own screen updates immediately) and sync to Supabase in
-the background; if a sync fails (e.g. you're offline), you'll get a toast
-telling you so rather than the change silently vanishing.
+### D. Create your first Admin
+1. Open your deployed URL and **Sign Up** with your own details.
+2. Back in Supabase **SQL Editor**, run:
+   ```sql
+   update public.profiles set user_level = 'Admin', approved = true
+   where email = 'your-admin-email@example.com';
+   ```
+3. Log back in — you now see **Users** and **Legends** in the sidebar, and can approve everyone else from the **Users** module.
+
+---
+
+## 2. Security notes (demo-appropriate, tighten before real use)
+
+- **Auth:** Supabase Auth (email + password). Passwords are hashed by Supabase, never touched by this app's code.
+- **Row Level Security (RLS)** is enabled on every table. A user can only read/write a module's data if:
+  - their account is `approved = true`, **and**
+  - their `access_control` JSON has that module set to `true` (or they are `Admin`, who can access everything).
+- **Delete** is restricted to `Admin` on every module, matching the spec.
+- **Case edits** made by non-Admin/non-Chief-Resident users are flagged `needs_admin_approval = true` in the database — the app shows a pending banner until an Admin or Chief Resident clears it.
+- The **anon key** is meant to be public — it only unlocks what your RLS policies allow, never more.
+- For a real government deployment, also turn on: email confirmation, a strong password policy in Supabase Auth settings, and consider Supabase's audit-log add-ons or a WAF in front of Cloudflare/Vercel.
+
+## 3. Migrating off Supabase later (Oracle or otherwise)
+
+The spec asked for this to be easy — here's how it's set up:
+
+- Every single database call in the app goes through one object: **`DB`** (search `JS:DB` in `index.html`). No other code calls `supabase-js` directly.
+- To migrate: rewrite the methods inside `DB` to call your new backend (e.g. a REST API in front of Oracle) instead of `sb.from(...)`. Every module (`Modules.patient_record`, `Modules.cases`, etc.) keeps working unchanged, because they only ever call `DB.patients.list()`, `DB.cases.create()`, and so on.
+- The schema avoids Postgres-only features where practical. `jsonb` columns (used for the multi-tab Case/OPD forms) map to `CLOB`/JSON columns on Oracle; `text[]` (used for Final Diagnosis bullets) maps to a small child table.
+- Row Level Security would need to be re-implemented as either database views/procedures or as checks inside your new API layer.
+
+## 4. What's already working
+
+- Login / Sign-up (with Admin-approval gate) / Log out / Refresh / My Profile
+- Collapsible sidebar nav, gated per-user by the Access Control checklist
+- **Overview** — live stat cards + OB vs GYNE and Cases-by-Department charts
+- **Patient Record** — create/search/filter/edit/delete, linked Cases shown on profile
+- **Cases** — department picker → full 8-tab OB-GYN form (Admission, Obstetric History,
+  Co-morbidities, Gynecological Conditions, MIGS, Blood, Final Diagnosis, Discharge),
+  auto BMI, auto hospital-days, "+Not in the list" adds new dropdown options live,
+  Admin/Chief-Resident approval flag on edits, Cases Data Summary with charts
+- **OPD** — 5-tab form (Information, Consultation, Procedures, Final Diagnosis, Actions),
+  OPD Data Summary with a monthly trend chart
+- **Tasks** — assign by module, acknowledge, complete with notes
+- **Directory** — add/search/edit contacts
+- **Users** — list, search, approve/decline, per-module Access Control checklist, activity history
+- **Activity Logs** — every create/update/delete is logged and filterable by module/user/date
+- **Legends** — every dropdown in the system is admin-editable and pre-seeded from your spec
+- Fully responsive/mobile layout (collapsible hamburger sidebar, stacked forms)
+- Philippine Time (Asia/Manila) used for all displayed dates/times
+
+## 5. TASK: TO BE UPDATED (left for a follow-up pass)
+
+Search `index.html` for the literal phrase **`TASK: TO BE UPDATED`** — each spot is commented in place. In summary:
+
+- **Wards module** — spec says "to follow upon the next update"; a placeholder screen and an empty `wards` table are in place, nothing else.
+- **Other departments' Case forms** (Internal Medicine, Surgery, Pediatrics, etc.) — only OB-GYN's 8-tab form is built, per the spec's "for now the web-app is for OB-GYN Department." Selecting another department shows a friendly "not built yet" message instead of crashing.
+- **CSV Import/Export & downloadable CSV templates** — mentioned throughout the spec (Patient Record, Cases, OPD, Legends) — not implemented in this pass; wire these up against `DB.patients`, `DB.cases`, `DB.opd`, `DB.legend_options` using a small CSV parser (e.g. PapaParse) when you're ready.
+- **PDF export/download buttons** — currently trigger the browser's print dialog as a placeholder; swap in a proper PDF library (e.g. jsPDF) for formatted letterhead output matching your reference report.
+- **Supabase → your production URL/key** — see §1.A step 4.
+
+## 6. File map
+
+- `index.html` — the entire application (HTML + CSS + JS in one file, per the requirement). Internally organized into clearly commented blocks (`STYLE:*`, `HTML:*`, `JS:*`) by module, so any one module (e.g. Cases) can be edited without touching the others.
+- `supabase_schema.sql` — full schema, security policies, and seed data for every dropdown list in the spec.
+- `README.md` — this file.
