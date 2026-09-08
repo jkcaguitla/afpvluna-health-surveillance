@@ -739,27 +739,33 @@ const DB = (() => {
 
   // ---- Auth (real Supabase Auth when DB_MODE === "supabase") ------------
   const Auth = {
-    // Creates a real Supabase Auth account, then inserts the matching
-    // public.users profile row with auth_uid set. Returns the profile row.
+    // Creates a real Supabase Auth account. The matching public.users
+    // profile row is created automatically by a database trigger (see
+    // AFP-VLUNA-auth-fix.sql — it fires on auth.users insert and runs with
+    // elevated privileges, so it doesn't need or wait on an RLS-governed
+    // client insert). Returns { profile, needsConfirmation }: profile is
+    // null when the project has "Confirm email" turned on, since no
+    // session (and therefore no readable row) exists until the user
+    // confirms.
     async signUp(email, password, profile) {
       const sb = supa();
-      const { data, error } = await sb.auth.signUp({ email, password });
+      const { data, error } = await sb.auth.signUp({
+        email, password,
+        options: { data: profile } // -> auth.users.raw_user_meta_data, read by the trigger
+      });
       if (error) throw error;
-      const authUid = data.user?.id;
-      if (!authUid) throw new Error("Sign-up succeeded but no auth user id was returned.");
 
-      const row = {
-        auth_uid: authUid,
-        email,
-        last_name: profile.last_name, first_name: profile.first_name, middle_name: profile.middle_name,
-        gender: profile.gender, designation: profile.designation, rank: profile.rank,
-        department: profile.department, address: profile.address, contact_number: profile.contact_number,
-        birthdate: profile.birthdate,
-        user_level: "Staff", status: "pending", access_opd: false
-      };
-      const { data: inserted, error: insertErr } = await sb.from("users").insert(row).select().single();
-      if (insertErr) throw insertErr;
-      return inserted;
+      if (!data.session) {
+        // Email confirmation required — no session yet, so the profile
+        // row (created by the trigger) isn't readable by this client
+        // until after confirmation + login.
+        return { profile: null, needsConfirmation: true };
+      }
+
+      const { data: row, error: rowErr } = await sb
+        .from("users").select("*").eq("auth_uid", data.user.id).single();
+      if (rowErr) throw rowErr;
+      return { profile: row, needsConfirmation: false };
     },
 
     // Signs in via Supabase Auth, then loads the matching public.users
@@ -1155,11 +1161,13 @@ const ModuleLogin = (() => {
         birthdate: document.getElementById("su_bd").value
       };
 
-      let rec;
+      let rec, needsConfirmation = false;
       if (APP_CONFIG.DB_MODE === "supabase") {
         submitBtn.disabled = true;
         try {
-          rec = await DB.auth.signUp(email, pw, profile);
+          const result = await DB.auth.signUp(email, pw, profile);
+          rec = result.profile;
+          needsConfirmation = result.needsConfirmation;
         } catch (err) {
           alertBox.innerHTML = `<div class="login-alert error">${esc(err.message || "Could not create account.")}</div>`;
           submitBtn.disabled = false;
@@ -1178,6 +1186,23 @@ const ModuleLogin = (() => {
           status: "pending",
           access_opd: false
         });
+      }
+
+      if (needsConfirmation) {
+        // No session yet (email confirmation required) — nothing to cache
+        // or sync to Directory until the user confirms and logs in.
+        root.innerHTML = `
+          <div class="login-wrap">
+            <div class="login-card">
+              <div class="login-brand">
+                <h1>Check your email</h1>
+                <p>We've sent a confirmation link to <b>${esc(email)}</b>. Confirm it, then sign in — an Admin will still need to approve your account before you get full access.</p>
+              </div>
+              <button class="btn btn-primary" id="backToLoginConfirm" style="width:100%; justify-content:center;">Back to Sign In</button>
+            </div>
+          </div>`;
+        document.getElementById("backToLoginConfirm").addEventListener("click", () => render(root));
+        return;
       }
 
       // Directory is still local-only for now (see the DB_MODE note at the
