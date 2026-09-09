@@ -607,25 +607,24 @@ const LEGEND_META = [
 </script>
 <script>
 /* =====================================================================
-   DATA LAYER / DB ADAPTER MODULE
-   Every read/write in the app goes through DB.* — none of the module
-   code below touches window.storage directly. To migrate from the demo
-   Supabase-shaped adapter to Oracle/AWS/Firebase, only this block needs
-   a new implementation of get/set/list; every screen keeps working.
+   DATA LAYER — Every read/write in the app goes through DB.* — none
+   of the module code below touches storage directly. DB itself never
+   changes: it delegates to whichever adapter is active (see
+   js_02a_adapters.js), so switching backends in Settings never
+   requires touching Patients/Cases/OPD/Tasks/Directory/Legends/etc.
    ===================================================================== */
 const DB = {
   _cache: {},
-  _prefix: "afpvluna_",
   _persistenceHealthy: true,
   _warnedOnce: false,
+  adapter: null, // set by activateAdapter() during boot
 
   async get(key, fallback) {
     if (this._cache[key] !== undefined) return this._cache[key];
     try {
-      const res = await window.storage.get(this._prefix + key, false);
-      const val = res && res.value ? JSON.parse(res.value) : fallback;
-      this._cache[key] = val;
-      return val;
+      const val = await this.adapter.get(key, fallback);
+      this._cache[key] = val === undefined ? fallback : val;
+      return this._cache[key];
     } catch (e) {
       this._cache[key] = fallback;
       return fallback;
@@ -635,11 +634,10 @@ const DB = {
   async set(key, value, _isRetry) {
     this._cache[key] = value; // keep the in-memory app fully working regardless of persistence
     try {
-      if (!window.storage || typeof window.storage.set !== "function") throw new Error("storage API unavailable");
-      await window.storage.set(this._prefix + key, JSON.stringify(value), false);
+      await this.adapter.set(key, value);
       this._persistenceHealthy = true;
       const dot = document.getElementById("sbPersistDot");
-      if (dot) { dot.style.background = "#7c9a4f"; dot.title = "Saving normally"; }
+      if (dot) { dot.style.background = "#7c9a4f"; dot.title = "Saving normally (" + this.adapter.name + ")"; }
       return true;
     } catch (e) {
       // Transient backend hiccups happen — retry once silently before giving up.
@@ -810,6 +808,19 @@ async function ensureSeedData() {
   if (!legends) {
     legends = JSON.parse(JSON.stringify(DEFAULT_LEGENDS));
     await DB.set("legends", legends);
+  } else {
+    // Migration: a session that started before a new legend list was
+    // added (e.g. minorSurgeries/majorSurgeries/evacType) will have a
+    // saved blob missing those keys — backfill anything new rather
+    // than assuming previously-saved data already has every key.
+    let migrated = false;
+    Object.keys(DEFAULT_LEGENDS).forEach(k => {
+      if (!(k in legends) || legends[k] === undefined || legends[k] === null) {
+        legends[k] = JSON.parse(JSON.stringify(DEFAULT_LEGENDS[k]));
+        migrated = true;
+      }
+    });
+    if (migrated) await DB.set("legends", legends);
   }
   STORE.legends = legends;
 
@@ -964,7 +975,7 @@ async function ensureSeedData() {
 
   let settings = await DB.get("settings", null);
   if (!settings) {
-    settings = { theme: "light", dbAdapter: "supabase", dbConnected: true };
+    settings = { theme: "light" };
     await DB.set("settings", settings);
   }
   STORE.settings = settings;
@@ -972,7 +983,399 @@ async function ensureSeedData() {
 </script>
 <script>
 /* =====================================================================
-   LOGIN PAGE MODULE — authentication, registration & approval gating
+   CONNECTION CONFIG
+   Always read/written through Claude's own artifact storage directly
+   (never through the swappable DB adapter below) — the app needs to
+   know which backend to use before it can use it, so this one small
+   config blob can't itself depend on the thing it configures.
+   Only ever holds: which adapter is active, a project URL, and an
+   ANON/public key. The service_role key is never requested or stored.
+   ===================================================================== */
+const ConnConfig = {
+  _key: "afpvluna_connconfig",
+  _cache: null,
+
+  async load() {
+    if (this._cache) return this._cache;
+    try {
+      const res = await window.storage.get(this._key, false);
+      this._cache = res && res.value ? JSON.parse(res.value) : this.defaults();
+    } catch (e) {
+      this._cache = this.defaults();
+    }
+    return this._cache;
+  },
+  defaults() {
+    return {
+      adapter: "local",
+      supabaseUrl: "", supabaseAnonKey: "",
+      supabaseAccessToken: "", supabaseRefreshToken: "", supabaseUserId: ""
+    };
+  },
+  async save(patch) {
+    this._cache = { ...(this._cache || this.defaults()), ...patch };
+    try {
+      await window.storage.set(this._key, JSON.stringify(this._cache), false);
+    } catch (e) {
+      console.warn("Could not persist connection config:", e.message || e);
+    }
+    return this._cache;
+  },
+  get() { return this._cache || this.defaults(); }
+};
+
+/* =====================================================================
+   LOCAL ADAPTER — Claude's built-in artifact session storage.
+   Zero setup, always available, good default and fallback. This is
+   what the app has been running on as a demo up to now.
+   ===================================================================== */
+const LocalAdapter = {
+  name: "local",
+  configure() {},
+  async get(key, fallback) {
+    const res = await window.storage.get("afpvluna_" + key, false);
+    return res && res.value ? JSON.parse(res.value) : fallback;
+  },
+  async set(key, value) {
+    await window.storage.set("afpvluna_" + key, JSON.stringify(value), false);
+    return true;
+  },
+  async testConnection() {
+    return { ok: true, message: "Using Claude's built-in session storage — no setup needed, but data is scoped to this session/browser only." };
+  }
+};
+
+/* =====================================================================
+   SUPABASE ADAPTER — real Postgres-backed persistence via Supabase's
+   REST API (PostgREST), reached with plain fetch() calls (no SDK
+   dependency to load). Bulk clinical collections (patients, cases,
+   opd, tasks, directory, legends, activity) are stored as JSON blobs
+   in one `app_storage` table, keyed by collection name — this keeps
+   every existing module's DB.get/DB.set calls working unmodified.
+   Identity (accounts, login, roles) is handled separately by
+   SupabaseAuth against real Supabase Auth + a `profiles` table —
+   see js_03_auth.js — because authentication is too security-critical
+   to flatten into a generic blob store.
+   ===================================================================== */
+const SupabaseAdapter = {
+  name: "supabase",
+  configure() {}, // kept for interface symmetry with LocalAdapter — no snapshot is cached (see below)
+
+  /* Always reads the live config instead of a cached snapshot, so a
+     token cleared by logout (or rotated by a refresh) is never missed —
+     that exact staleness bug is why this method exists instead of a
+     stored this.cfg. */
+  _cfg() { return ConnConfig.get(); },
+
+  _headers(extra) {
+    const cfg = this._cfg();
+    return {
+      "Content-Type": "application/json",
+      apikey: cfg.supabaseAnonKey || "",
+      Authorization: "Bearer " + (cfg.supabaseAccessToken || cfg.supabaseAnonKey || ""),
+      ...extra
+    };
+  },
+
+  /* Shared fetch wrapper: on 401 (expired token) try one silent refresh via SupabaseAuth, then retry once. */
+  async _fetch(url, opts, _isRetry) {
+    const res = await fetch(url, opts);
+    if (res.status === 401 && !_isRetry) {
+      const cfg = this._cfg();
+      if (typeof SupabaseAuth !== "undefined" && cfg.supabaseRefreshToken) {
+        const refreshed = await SupabaseAuth.refreshSession(cfg);
+        if (refreshed) {
+          const retryOpts = { ...opts, headers: this._headers(opts.headers && opts.headers.Prefer ? { Prefer: opts.headers.Prefer } : {}) };
+          return this._fetch(url, retryOpts, true);
+        }
+      }
+    }
+    return res;
+  },
+
+  async get(key, fallback) {
+    const cfg = this._cfg();
+    if (!cfg || !cfg.supabaseUrl || !cfg.supabaseAnonKey) throw new Error("Supabase is not configured yet");
+    const url = `${cfg.supabaseUrl}/rest/v1/app_storage?key=eq.${encodeURIComponent("afpvluna_" + key)}&select=value`;
+    const res = await this._fetch(url, { headers: this._headers() });
+    if (!res.ok) throw new Error(`Supabase read failed (HTTP ${res.status})`);
+    const rows = await res.json();
+    if (!rows.length) return fallback;
+    return rows[0].value;
+  },
+
+  async set(key, value) {
+    const cfg = this._cfg();
+    if (!cfg || !cfg.supabaseUrl || !cfg.supabaseAnonKey) throw new Error("Supabase is not configured yet");
+    const url = `${cfg.supabaseUrl}/rest/v1/app_storage`;
+    const res = await this._fetch(url, {
+      method: "POST",
+      headers: this._headers({ Prefer: "resolution=merge-duplicates,return=minimal" }),
+      body: JSON.stringify({ key: "afpvluna_" + key, value, updated_at: new Date().toISOString() })
+    });
+    if (!res.ok) throw new Error(`Supabase write failed (HTTP ${res.status})`);
+    return true;
+  },
+
+  async testConnection(cfg) {
+    if (!cfg.supabaseUrl || !cfg.supabaseAnonKey) return { ok: false, message: "Enter both the Project URL and the anon public key first." };
+    if (!/^https:\/\/.+\.supabase\.co\/?$/.test(cfg.supabaseUrl.replace(/\/$/, "") + "/") && !/^https:\/\//.test(cfg.supabaseUrl)) {
+      return { ok: false, message: "That doesn't look like a valid https:// Supabase URL." };
+    }
+    try {
+      const res = await fetch(`${cfg.supabaseUrl.replace(/\/$/, "")}/rest/v1/app_storage?select=key&limit=1`, {
+        headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAnonKey }
+      });
+      if (res.ok) return { ok: true, message: "Connected — the app_storage table was found." };
+      if (res.status === 404 || res.status === 400) return { ok: false, message: "Reached Supabase, but the app_storage table doesn't exist yet. Run the setup SQL in the Supabase SQL editor first." };
+      if (res.status === 401 || res.status === 403) return { ok: false, message: "Reached Supabase, but the anon key was rejected. Double-check it in Supabase → Settings → API." };
+      return { ok: false, message: `Unexpected response (HTTP ${res.status}).` };
+    } catch (e) {
+      return { ok: false, message: "Could not reach that URL — check it's correct and reachable: " + (e.message || e) };
+    }
+  }
+};
+
+const ADAPTERS = { local: LocalAdapter, supabase: SupabaseAdapter };
+
+async function activateAdapter(name, cfg) {
+  const a = ADAPTERS[name] || LocalAdapter;
+  if (a.configure) a.configure(cfg || {});
+  DB.adapter = a;
+  DB._cache = {}; // never mix cached reads across a backend switch
+  return a;
+}
+</script>
+<script>
+const SUPABASE_SETUP_SQL = `
+-- ============================================================
+-- AFP VLUNA MC — Supabase setup script
+-- Safe to re-run: every statement uses IF NOT EXISTS / OR REPLACE /
+-- DROP ... IF EXISTS, so re-running this after an update won't break
+-- anything that already exists.
+--
+-- HOW TO RUN: Supabase Dashboard → SQL Editor → New query → paste
+-- this whole file → Run.
+--
+-- Two tables are created:
+--   1. app_storage — one JSON blob per data collection (patients,
+--      cases, opd, tasks, directory, legends, activity, settings).
+--      This keeps every existing screen in the app working exactly
+--      as-is; it is NOT a normalized relational schema. Treat this
+--      as the "get a real database under it safely" step — moving
+--      to fully normalized tables (patients as real rows, cases
+--      with real foreign keys, etc.) is a bigger follow-up project.
+--   2. profiles — one real row per user account, linked to Supabase
+--      Auth. This IS how login/roles/approval work — identity is
+--      handled properly, not as a blob, because it's the highest-
+--      risk part of the system.
+-- ============================================================
+
+-- ---------- 1. app_storage (clinical data collections) ----------
+create table if not exists public.app_storage (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.app_storage enable row level security;
+
+drop policy if exists "authenticated read app_storage" on public.app_storage;
+create policy "authenticated read app_storage" on public.app_storage
+  for select using (auth.role() = 'authenticated');
+
+drop policy if exists "authenticated insert app_storage" on public.app_storage;
+create policy "authenticated insert app_storage" on public.app_storage
+  for insert with check (auth.role() = 'authenticated');
+
+drop policy if exists "authenticated update app_storage" on public.app_storage;
+create policy "authenticated update app_storage" on public.app_storage
+  for update using (auth.role() = 'authenticated');
+
+-- Note: this policy set means any logged-in, approved user can read/write
+-- any collection (patients, cases, tasks, etc.) — a large improvement
+-- over no protection at all, but not yet fine-grained per-module or
+-- per-role at the database level (the app's own UI still restricts
+-- which screens each role can reach). Field- and table-level RLS is
+-- part of the normalized-schema follow-up mentioned above.
+
+-- ---------- 2. profiles (real user accounts & roles) ----------
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text,
+  last_name text, first_name text, middle_name text, gender text,
+  designation text, rank text, department text, address text, contact text, birthdate date,
+  user_level text not null default 'Junior',
+  status text not null default 'pending',  -- pending | approved | declined
+  access jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+alter table public.profiles enable row level security;
+
+-- Security-definer helper avoids RLS self-recursion when a policy
+-- needs to check "is the requester an Admin" by querying this same table.
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles where id = auth.uid() and user_level = 'Admin'
+  );
+$$;
+
+drop policy if exists "view own profile" on public.profiles;
+create policy "view own profile" on public.profiles
+  for select using (auth.uid() = id);
+
+drop policy if exists "admins view all profiles" on public.profiles;
+create policy "admins view all profiles" on public.profiles
+  for select using (public.is_admin());
+
+drop policy if exists "users update own profile" on public.profiles;
+create policy "users update own profile" on public.profiles
+  for update using (auth.uid() = id);
+
+drop policy if exists "admins update any profile" on public.profiles;
+create policy "admins update any profile" on public.profiles
+  for update using (public.is_admin());
+
+drop policy if exists "admins delete any profile" on public.profiles;
+create policy "admins delete any profile" on public.profiles
+  for delete using (public.is_admin());
+
+-- Auto-create a profile row the instant someone signs up, so the
+-- client app never needs (or gets) INSERT permission on profiles itself.
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (id, email, status, user_level, access)
+  values (new.id, new.email, 'pending', 'Junior', '[]'::jsonb);
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
+
+-- ============================================================
+-- ONE-TIME MANUAL STEP (recommended, not run by this script):
+-- In the Supabase Dashboard, go to Authentication → Providers → Email
+-- and turn OFF "Confirm email". This is an internal hospital tool
+-- behind your own access control, not a public signup form — leaving
+-- email confirmation off lets new staff finish their profile details
+-- immediately after registering instead of only after confirming an
+-- email address. You can leave it ON if you prefer; registration
+-- still works, it just means the extra profile fields (rank,
+-- designation, etc.) only sync in after the user's first login.
+-- ============================================================
+
+-- ============================================================
+-- FIRST ADMIN ACCOUNT: after you sign up your own account once from
+-- the app's login screen, run this (with YOUR email) so you're not
+-- locked out waiting for an admin to approve you:
+--
+--   update public.profiles set status = 'approved', user_level = 'Admin',
+--     access = '["OPD","Overview","Directory","Cases","Legends","Activity Logs","Users","Tasks","Wards","Patient Record"]'::jsonb
+--   where email = 'you@example.com';
+-- ============================================================
+`;
+</script>
+<script>
+/* =====================================================================
+   SUPABASE AUTH SUB-MODULE — talks to Supabase's real Auth REST API
+   and the `profiles` table (see setup SQL). Kept separate from the
+   generic blob-storage adapter on purpose: identity is the highest-
+   risk part of this app, so it gets its own real, auditable path
+   instead of being flattened into a JSON blob like the clinical
+   collections are. Never handles or stores the service_role key.
+   ===================================================================== */
+const SupabaseAuth = {
+  _hdrs(cfg, extra) {
+    return { "Content-Type": "application/json", apikey: cfg.supabaseAnonKey, ...extra };
+  },
+  async signUp(cfg, email, password) {
+    const res = await fetch(`${cfg.supabaseUrl}/auth/v1/signup`, { method: "POST", headers: this._hdrs(cfg), body: JSON.stringify({ email, password }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error_description || data.msg || data.error || "Sign up failed");
+    return data; // { access_token, refresh_token, user } if email confirmation is off, else just { id, email, ... }
+  },
+  async signIn(cfg, email, password) {
+    const res = await fetch(`${cfg.supabaseUrl}/auth/v1/token?grant_type=password`, { method: "POST", headers: this._hdrs(cfg), body: JSON.stringify({ email, password }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error_description || data.msg || "Invalid login credentials");
+    return data; // { access_token, refresh_token, user }
+  },
+  async signOut(cfg) {
+    try {
+      await fetch(`${cfg.supabaseUrl}/auth/v1/logout`, { method: "POST", headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAccessToken } });
+    } catch (e) { /* best-effort — local session is cleared regardless */ }
+  },
+  async refreshSession(cfg) {
+    try {
+      const res = await fetch(`${cfg.supabaseUrl}/auth/v1/token?grant_type=refresh_token`, { method: "POST", headers: this._hdrs(cfg), body: JSON.stringify({ refresh_token: cfg.supabaseRefreshToken }) });
+      if (!res.ok) return false;
+      const data = await res.json();
+      await ConnConfig.save({ supabaseAccessToken: data.access_token, supabaseRefreshToken: data.refresh_token });
+      return true;
+    } catch (e) { return false; }
+  },
+  async fetchProfile(cfg, userId) {
+    const res = await fetch(`${cfg.supabaseUrl}/rest/v1/profiles?id=eq.${userId}&select=*`, { headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAccessToken } });
+    if (!res.ok) throw new Error("Could not load profile (HTTP " + res.status + ")");
+    const rows = await res.json();
+    return rows[0] || null;
+  },
+  async fetchAllProfiles(cfg) {
+    const res = await fetch(`${cfg.supabaseUrl}/rest/v1/profiles?select=*`, { headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAccessToken } });
+    if (!res.ok) throw new Error("Could not load users (HTTP " + res.status + ")");
+    return await res.json();
+  },
+  async updateProfile(cfg, id, patch) {
+    const res = await fetch(`${cfg.supabaseUrl}/rest/v1/profiles?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAccessToken, "Content-Type": "application/json", Prefer: "return=representation" },
+      body: JSON.stringify(patch)
+    });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.message || "Could not update profile (HTTP " + res.status + ")"); }
+    const rows = await res.json();
+    return rows[0];
+  },
+  async deleteProfile(cfg, id) {
+    const res = await fetch(`${cfg.supabaseUrl}/rest/v1/profiles?id=eq.${id}`, { method: "DELETE", headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAccessToken } });
+    return res.ok;
+  }
+};
+
+/* snake_case (Postgres) <-> camelCase (app) field mapping for profiles */
+function profileRowToUser(row) {
+  return {
+    id: row.id, email: row.email, lastName: row.last_name || "", firstName: row.first_name || "", middleName: row.middle_name || "",
+    gender: row.gender || "", designation: row.designation || "", rank: row.rank || "", department: row.department || "",
+    address: row.address || "", contact: row.contact || "", birthdate: row.birthdate || "", userLevel: row.user_level || "Junior",
+    status: row.status || "pending", access: row.access || [], createdAt: row.created_at
+  };
+}
+function userPatchToRow(patch) {
+  const map = { lastName: "last_name", firstName: "first_name", middleName: "middle_name", userLevel: "user_level" };
+  const out = {};
+  Object.entries(patch).forEach(([k, v]) => { out[map[k] || k] = v; });
+  return out;
+}
+
+/* =====================================================================
+   LOGIN PAGE MODULE — authentication, registration & approval gating.
+   Branches on the active adapter: 'local' keeps the original demo
+   behaviour (plaintext, in-memory — clearly a demo, never for real
+   patient data); 'supabase' goes through real Supabase Auth above.
    ===================================================================== */
 const Auth = {
   showLogin() {
@@ -996,29 +1399,48 @@ const Auth = {
   validatePassword(pw) {
     return pw.length >= 8 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
   },
+  usingSupabase() { return DB.adapter && DB.adapter.name === "supabase"; },
+
   async login() {
     const email = document.getElementById("loginEmail").value.trim().toLowerCase();
     const pw = document.getElementById("loginPassword").value;
     document.getElementById("loginAlertBox").innerHTML = "";
     if (!email || !pw) { this.alertBox("loginAlertBox", "danger", "Enter your username and password."); return; }
+    if (this.usingSupabase()) return this.loginSupabase(email, pw);
+    return this.loginLocal(email, pw);
+  },
+
+  async loginLocal(email, pw) {
     const user = STORE.users.find(u => u.email.toLowerCase() === email);
-    if (!user || user.password !== pw) {
-      this.alertBox("loginAlertBox", "danger", "Invalid username or password.");
-      return;
-    }
-    if (user.status === "pending") {
-      this.alertBox("loginAlertBox", "warn", "Your account is awaiting approval. Please contact your ADMIN — access is not yet available.");
-      return;
-    }
-    if (user.status === "declined") {
-      this.alertBox("loginAlertBox", "danger", "Your registration was declined. Please contact your ADMIN.");
-      return;
-    }
+    if (!user || user.password !== pw) { this.alertBox("loginAlertBox", "danger", "Invalid username or password."); return; }
+    if (user.status === "pending") { this.alertBox("loginAlertBox", "warn", "Your account is awaiting approval. Please contact your ADMIN — access is not yet available."); return; }
+    if (user.status === "declined") { this.alertBox("loginAlertBox", "danger", "Your registration was declined. Please contact your ADMIN."); return; }
     STORE.session = user;
     await DB.set("session_user_id", user.id);
     await logActivity("Users", "Signed in", `${fullName(user)} logged in`);
     App.boot();
   },
+
+  async loginSupabase(email, pw) {
+    const cfg = ConnConfig.get();
+    try {
+      const data = await SupabaseAuth.signIn(cfg, email, pw);
+      await ConnConfig.save({ supabaseAccessToken: data.access_token, supabaseRefreshToken: data.refresh_token, supabaseUserId: data.user.id });
+      SupabaseAdapter.configure(ConnConfig.get());
+      const row = await SupabaseAuth.fetchProfile(ConnConfig.get(), data.user.id);
+      if (!row) { this.alertBox("loginAlertBox", "danger", "Signed in, but no profile record was found. Contact your ADMIN."); return; }
+      const user = profileRowToUser(row);
+      if (user.status === "pending") { this.alertBox("loginAlertBox", "warn", "Your account is awaiting approval. Please contact your ADMIN — access is not yet available."); return; }
+      if (user.status === "declined") { this.alertBox("loginAlertBox", "danger", "Your registration was declined. Please contact your ADMIN."); return; }
+      STORE.session = user;
+      try { const rows = await SupabaseAuth.fetchAllProfiles(ConnConfig.get()); STORE.users = rows.map(profileRowToUser); } catch (e) { console.warn("Could not load full user list:", e.message); }
+      await logActivity("Users", "Signed in", `${fullName(user)} logged in`);
+      App.boot();
+    } catch (e) {
+      this.alertBox("loginAlertBox", "danger", e.message || "Invalid username or password.");
+    }
+  },
+
   async signup() {
     const box = "signupAlertBox";
     document.getElementById(box).innerHTML = "";
@@ -1028,6 +1450,11 @@ const Auth = {
     if (!f("suLast") || !f("suFirst") || !email) { this.alertBox(box, "danger", "Please complete all required fields."); return; }
     if (!this.validatePassword(pw)) { this.alertBox(box, "danger", "Password must be 8+ characters with a letter, a number, and a symbol."); return; }
     if (pw !== pw2) { this.alertBox(box, "danger", "Passwords do not match."); return; }
+    if (this.usingSupabase()) return this.signupSupabase(box, email, pw, f);
+    return this.signupLocal(box, email, pw, f);
+  },
+
+  async signupLocal(box, email, pw, f) {
     if (STORE.users.some(u => u.email.toLowerCase() === email)) { this.alertBox(box, "danger", "An account with this email already exists."); return; }
     const newUser = {
       id: DB.uid("u"), email, password: pw,
@@ -1049,10 +1476,45 @@ const Auth = {
     this.alertBox(box, "ok", "Registration submitted. Please wait for ADMIN approval before signing in.");
     setTimeout(() => this.showLogin(), 1600);
   },
+
+  async signupSupabase(box, email, pw, f) {
+    const cfg = ConnConfig.get();
+    try {
+      const data = await SupabaseAuth.signUp(cfg, email, pw);
+      const extra = {
+        last_name: f("suLast"), first_name: f("suFirst"), middle_name: f("suMiddle"), gender: f("suGender"),
+        designation: f("suDesignation"), rank: f("suRank"), department: f("suDepartment"),
+        address: f("suAddress"), contact: f("suContact"), birthdate: f("suBirthdate") || null
+      };
+      if (data.access_token && data.user) {
+        // Email confirmation is off on this project — we have a session immediately,
+        // so we can fill in the rest of the profile the `profiles` trigger created.
+        await ConnConfig.save({ supabaseAccessToken: data.access_token, supabaseRefreshToken: data.refresh_token, supabaseUserId: data.user.id });
+        SupabaseAdapter.configure(ConnConfig.get());
+        await SupabaseAuth.updateProfile(ConnConfig.get(), data.user.id, extra);
+        await SupabaseAuth.signOut(ConnConfig.get());
+        await ConnConfig.save({ supabaseAccessToken: "", supabaseRefreshToken: "", supabaseUserId: "" });
+        this.alertBox(box, "ok", "Registration submitted. Please wait for ADMIN approval before signing in.");
+      } else {
+        // Email confirmation is required on this project — the profiles row already
+        // exists (created by the database trigger) but the extra fields can't be
+        // saved until the user confirms their email and logs in once.
+        this.alertBox(box, "ok", "Registration submitted. Please check your email to confirm your account, then sign in — an ADMIN will still need to approve access after that.");
+      }
+      setTimeout(() => this.showLogin(), 2200);
+    } catch (e) {
+      this.alertBox(box, "danger", e.message || "Could not complete registration.");
+    }
+  },
+
   async logout() {
+    if (this.usingSupabase() && STORE.session) {
+      await SupabaseAuth.signOut(ConnConfig.get());
+      await ConnConfig.save({ supabaseAccessToken: "", supabaseRefreshToken: "", supabaseUserId: "" });
+    }
     if (STORE.session) await logActivity("Users", "Signed out", `${fullName(STORE.session)} logged out`);
     STORE.session = null;
-    await DB.set("session_user_id", null);
+    if (!this.usingSupabase()) await DB.set("session_user_id", null);
     document.getElementById("appShell").classList.remove("active");
     document.getElementById("loginScreen").style.display = "flex";
     this.showLogin();
@@ -1261,7 +1723,7 @@ const App = {
     document.getElementById("tbAvatar").textContent = initials(u);
     document.getElementById("tbUserName").textContent = `${u.firstName} ${u.lastName}`;
     document.getElementById("tbUserRole").textContent = u.userLevel;
-    document.getElementById("sbDbAdapter").textContent = STORE.settings.dbAdapter.charAt(0).toUpperCase() + STORE.settings.dbAdapter.slice(1);
+    document.getElementById("sbDbAdapter").textContent = DB.adapter.name === "supabase" ? "Supabase" : "Local (demo)";
     document.documentElement.setAttribute("data-theme", STORE.settings.theme);
     if (window.innerWidth <= 760) document.getElementById("mobileNavBtn").style.display = "flex";
     UI.renderSidebar();
@@ -1289,15 +1751,38 @@ async function initAppData() {
   document.getElementById("brandLogo").src = logo;
   document.getElementById("sbLogo").src = logo;
 
+  // Which backend to use is decided before anything else loads.
+  const cfg = await ConnConfig.load();
+  await activateAdapter(cfg.adapter, cfg);
+
   await ensureSeedData();
 
-  const sessionId = await DB.get("session_user_id", null);
-  if (sessionId) {
-    const u = STORE.users.find(x => x.id === sessionId);
-    if (u && u.status === "approved") {
-      STORE.session = u;
-      App.boot();
-      return;
+  // Session resume: local-adapter demo sessions and Supabase sessions
+  // are resumed differently, since only one of them has a real token.
+  if (DB.adapter.name === "supabase" && cfg.supabaseAccessToken && cfg.supabaseUserId) {
+    try {
+      const row = await SupabaseAuth.fetchProfile(cfg, cfg.supabaseUserId);
+      if (row) {
+        const user = profileRowToUser(row);
+        if (user.status === "approved") {
+          STORE.session = user;
+          try { const rows = await SupabaseAuth.fetchAllProfiles(cfg); STORE.users = rows.map(profileRowToUser); } catch (e) {}
+          App.boot();
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn("Could not resume Supabase session:", e.message || e);
+    }
+  } else if (DB.adapter.name === "local") {
+    const sessionId = await DB.get("session_user_id", null);
+    if (sessionId) {
+      const u = STORE.users.find(x => x.id === sessionId);
+      if (u && u.status === "approved") {
+        STORE.session = u;
+        App.boot();
+        return;
+      }
     }
   }
   document.getElementById("loginScreen").style.display = "flex";
@@ -2663,6 +3148,7 @@ Modules.cases = {
    ===================================================================== */
 Modules.opd = {
   page: 1, perPage: 8, filters: {}, activeTab: 1, draft: null,
+  activityPage: 0, activityPerPage: 8,
 
   render() {
     const el = document.getElementById("mod-opd");
@@ -2700,10 +3186,36 @@ Modules.opd = {
         </div>
         <div class="pagenav" id="opdPagenav"></div>
       </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Recent Activity — OPD (last 3 days)</h3></div>
+        <div class="panel-body" id="opdActivityBody"></div>
+        <div class="small-nav-arrows" id="opdActivityNav"></div>
+      </div>
     `;
     this.renderTable();
+    this.activityPage = 0;
+    this.renderActivityFeed();
   },
   toggleTasks() { const b = document.getElementById("opdTasksBody"); b.style.display = b.style.display === "none" ? "block" : "none"; },
+  getRecentActivity() {
+    const cutoff = Date.now() - 3 * 86400000;
+    return STORE.activity.filter(a => a.module === "OPD" && new Date(a.timestamp).getTime() >= cutoff);
+  },
+  renderActivityFeed() {
+    const items = this.getRecentActivity();
+    const totalPages = Math.max(1, Math.ceil(items.length / this.activityPerPage));
+    this.activityPage = Math.min(this.activityPage, totalPages - 1);
+    const pageItems = items.slice(this.activityPage * this.activityPerPage, (this.activityPage + 1) * this.activityPerPage);
+    document.getElementById("opdActivityBody").innerHTML = pageItems.length ? `
+      <table class="data-table-sm"><thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>What Changed</th></tr></thead>
+      <tbody>${pageItems.map(a => `<tr><td>${new Date(a.timestamp).toLocaleString("en-US",{timeZone:"Asia/Manila"})}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join("")}</tbody></table>
+    ` : `<div class="empty-state"><p>No OPD activity in the last 3 days.</p></div>`;
+    document.getElementById("opdActivityNav").innerHTML = `
+      <button onclick="Modules.opd.activityPage--;Modules.opd.renderActivityFeed()" ${this.activityPage<=0?"disabled":""}>‹</button>
+      Page ${this.activityPage+1} of ${totalPages}
+      <button onclick="Modules.opd.activityPage++;Modules.opd.renderActivityFeed()" ${this.activityPage>=totalPages-1?"disabled":""}>›</button>
+    `;
+  },
   setFilter(k,v){ this.filters[k]=v; this.page=1; this.renderTable(); },
   getFiltered() {
     let arr = [...STORE.opd];
@@ -3185,6 +3697,7 @@ Modules.tasks = {
    ===================================================================== */
 Modules.directory = {
   page: 1, perPage: 10, filters: {},
+  activityPage: 0, activityPerPage: 8,
 
   render() {
     document.getElementById("mod-directory").innerHTML = `
@@ -3204,8 +3717,34 @@ Modules.directory = {
         </table></div>
         <div class="pagenav" id="dirPagenav"></div>
       </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Recent Activity — Directory (last 3 days)</h3></div>
+        <div class="panel-body" id="dirActivityBody"></div>
+        <div class="small-nav-arrows" id="dirActivityNav"></div>
+      </div>
     `;
     this.renderTable();
+    this.activityPage = 0;
+    this.renderActivityFeed();
+  },
+  getRecentActivity() {
+    const cutoff = Date.now() - 3 * 86400000;
+    return STORE.activity.filter(a => a.module === "Directory" && new Date(a.timestamp).getTime() >= cutoff);
+  },
+  renderActivityFeed() {
+    const items = this.getRecentActivity();
+    const totalPages = Math.max(1, Math.ceil(items.length / this.activityPerPage));
+    this.activityPage = Math.min(this.activityPage, totalPages - 1);
+    const pageItems = items.slice(this.activityPage * this.activityPerPage, (this.activityPage + 1) * this.activityPerPage);
+    document.getElementById("dirActivityBody").innerHTML = pageItems.length ? `
+      <table class="data-table-sm"><thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>What Changed</th></tr></thead>
+      <tbody>${pageItems.map(a => `<tr><td>${new Date(a.timestamp).toLocaleString("en-US",{timeZone:"Asia/Manila"})}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join("")}</tbody></table>
+    ` : `<div class="empty-state"><p>No Directory activity in the last 3 days.</p></div>`;
+    document.getElementById("dirActivityNav").innerHTML = `
+      <button onclick="Modules.directory.activityPage--;Modules.directory.renderActivityFeed()" ${this.activityPage<=0?"disabled":""}>‹</button>
+      Page ${this.activityPage+1} of ${totalPages}
+      <button onclick="Modules.directory.activityPage++;Modules.directory.renderActivityFeed()" ${this.activityPage>=totalPages-1?"disabled":""}>›</button>
+    `;
   },
   toggleTasks() { const b=document.getElementById("dirTasksBody"); b.style.display = b.style.display==="none"?"block":"none"; },
   setFilter(k,v){ this.filters[k]=v; this.page=1; this.renderTable(); },
@@ -3322,6 +3861,7 @@ Modules.directory = {
    ===================================================================== */
 Modules.users = {
   filters: {},
+  activityPage: 0, activityPerPage: 8,
 
   render() {
     const el = document.getElementById("mod-users");
@@ -3344,8 +3884,34 @@ Modules.users = {
           <tbody id="usersTbody"></tbody>
         </table></div>
       </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Recent Activity — Users (last 3 days)</h3></div>
+        <div class="panel-body" id="usrActivityBody"></div>
+        <div class="small-nav-arrows" id="usrActivityNav"></div>
+      </div>
     `;
     this.renderTable();
+    this.activityPage = 0;
+    this.renderActivityFeed();
+  },
+  getRecentActivity() {
+    const cutoff = Date.now() - 3 * 86400000;
+    return STORE.activity.filter(a => a.module === "Users" && new Date(a.timestamp).getTime() >= cutoff);
+  },
+  renderActivityFeed() {
+    const items = this.getRecentActivity();
+    const totalPages = Math.max(1, Math.ceil(items.length / this.activityPerPage));
+    this.activityPage = Math.min(this.activityPage, totalPages - 1);
+    const pageItems = items.slice(this.activityPage * this.activityPerPage, (this.activityPage + 1) * this.activityPerPage);
+    document.getElementById("usrActivityBody").innerHTML = pageItems.length ? `
+      <table class="data-table-sm"><thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>What Changed</th></tr></thead>
+      <tbody>${pageItems.map(a => `<tr><td>${new Date(a.timestamp).toLocaleString("en-US",{timeZone:"Asia/Manila"})}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join("")}</tbody></table>
+    ` : `<div class="empty-state"><p>No Users activity in the last 3 days.</p></div>`;
+    document.getElementById("usrActivityNav").innerHTML = `
+      <button onclick="Modules.users.activityPage--;Modules.users.renderActivityFeed()" ${this.activityPage<=0?"disabled":""}>‹</button>
+      Page ${this.activityPage+1} of ${totalPages}
+      <button onclick="Modules.users.activityPage++;Modules.users.renderActivityFeed()" ${this.activityPage>=totalPages-1?"disabled":""}>›</button>
+    `;
   },
   toggleTasks() { const b=document.getElementById("usrTasksBody"); b.style.display = b.style.display==="none"?"block":"none"; },
   setFilter(k,v){ this.filters[k]=v; this.renderTable(); },
@@ -3378,13 +3944,15 @@ Modules.users = {
   },
   async approve(id) {
     const u = STORE.users.find(x=>x.id===id); u.status = 'approved'; u.access = [...DEFAULT_LEGENDS.accessModules];
-    await DB.set("users", STORE.users);
+    if (Auth.usingSupabase()) { try { await SupabaseAuth.updateProfile(ConnConfig.get(), id, { status: 'approved', access: u.access }); } catch(e) { UI.toast(e.message, "err"); } }
+    else await DB.set("users", STORE.users);
     await logActivity("Users", "Approved account", fullName(u));
     UI.toast(`${fullName(u)} approved`); this.render(); UI.renderSidebar();
   },
   async decline(id) {
     const u = STORE.users.find(x=>x.id===id); u.status = 'declined';
-    await DB.set("users", STORE.users);
+    if (Auth.usingSupabase()) { try { await SupabaseAuth.updateProfile(ConnConfig.get(), id, { status: 'declined' }); } catch(e) { UI.toast(e.message, "err"); } }
+    else await DB.set("users", STORE.users);
     await logActivity("Users", "Declined account", fullName(u));
     UI.toast(`${fullName(u)} declined`); this.render(); UI.renderSidebar();
   },
@@ -3426,7 +3994,8 @@ Modules.users = {
     u.access = u.access || [];
     if (checked && !u.access.includes(moduleName)) u.access.push(moduleName);
     if (!checked) u.access = u.access.filter(m=>m!==moduleName);
-    await DB.set("users", STORE.users);
+    if (Auth.usingSupabase()) { try { await SupabaseAuth.updateProfile(ConnConfig.get(), id, { access: u.access }); } catch(e) { UI.toast(e.message, "err"); } }
+    else await DB.set("users", STORE.users);
     await logActivity("Users", "Updated access", `${fullName(u)} — ${moduleName}: ${checked?'granted':'revoked'}`);
   },
   editUser(id) {
@@ -3445,15 +4014,21 @@ Modules.users = {
     u.userLevel = document.getElementById("uf_level").value;
     u.rank = document.getElementById("uf_rank").value;
     u.contact = document.getElementById("uf_contact").value;
-    await DB.set("users", STORE.users);
+    if (Auth.usingSupabase()) {
+      try { await SupabaseAuth.updateProfile(ConnConfig.get(), id, { user_level: u.userLevel, rank: u.rank, contact: u.contact }); }
+      catch(e) { UI.toast(e.message, "err"); return; }
+    } else await DB.set("users", STORE.users);
     await logActivity("Users", "Edited user", fullName(u));
     UI.closeModal(); UI.toast("User updated"); this.render();
   },
   async remove(id) {
-    if (!confirm("Delete this user account?")) return;
+    if (!confirm("Delete this user account? " + (Auth.usingSupabase() ? "This removes their profile and access, but their Supabase Auth login will need to be removed separately by a project admin (that requires the service_role key, which this app never handles)." : "") )) return;
+    if (Auth.usingSupabase()) {
+      try { await SupabaseAuth.deleteProfile(ConnConfig.get(), id); } catch(e) { UI.toast(e.message, "err"); return; }
+    }
     STORE.users = STORE.users.filter(x=>x.id!==id);
-    await DB.set("users", STORE.users);
-    UI.closeModal(); this.render(); UI.toast("User deleted");
+    if (!Auth.usingSupabase()) await DB.set("users", STORE.users);
+    UI.closeModal(); this.render(); UI.toast("User record deleted");
   }
 };
 </script>
@@ -3506,6 +4081,8 @@ Modules.activity = {
    LEGENDS MODULE (screen) — CRUD editor for every dropdown definition
    ===================================================================== */
 Modules.legends = {
+  activityPage: 0, activityPerPage: 8,
+
   render() {
     const el = document.getElementById("mod-legends");
     el.innerHTML = `
@@ -3514,6 +4091,11 @@ Modules.legends = {
         <div class="page-actions"><button class="btn btn-outline btn-sm" onclick="Modules.legends.downloadPDF()">Download PDF</button></div>
       </div>
       <div id="legendSections"></div>
+      <div class="panel">
+        <div class="panel-head"><h3>Recent Activity — Legends (last 3 days)</h3></div>
+        <div class="panel-body" id="legActivityBody"></div>
+        <div class="small-nav-arrows" id="legActivityNav"></div>
+      </div>
     `;
     document.getElementById("legendSections").innerHTML = LEGEND_META.map(m => `
       <div class="panel">
@@ -3529,21 +4111,44 @@ Modules.legends = {
       </div>
     `).join("");
     LEGEND_META.forEach(m => this.renderSection(m.key));
+    this.activityPage = 0;
+    this.renderActivityFeed();
+  },
+  getRecentActivity() {
+    const cutoff = Date.now() - 3 * 86400000;
+    return STORE.activity.filter(a => a.module === "Legends" && new Date(a.timestamp).getTime() >= cutoff);
+  },
+  renderActivityFeed() {
+    const items = this.getRecentActivity();
+    const totalPages = Math.max(1, Math.ceil(items.length / this.activityPerPage));
+    this.activityPage = Math.min(this.activityPage, totalPages - 1);
+    const pageItems = items.slice(this.activityPage * this.activityPerPage, (this.activityPage + 1) * this.activityPerPage);
+    document.getElementById("legActivityBody").innerHTML = pageItems.length ? `
+      <table class="data-table-sm"><thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>What Changed</th></tr></thead>
+      <tbody>${pageItems.map(a => `<tr><td>${new Date(a.timestamp).toLocaleString("en-US",{timeZone:"Asia/Manila"})}</td><td>${esc(a.user)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join("")}</tbody></table>
+    ` : `<div class="empty-state"><p>No Legends activity in the last 3 days.</p></div>`;
+    document.getElementById("legActivityNav").innerHTML = `
+      <button onclick="Modules.legends.activityPage--;Modules.legends.renderActivityFeed()" ${this.activityPage<=0?"disabled":""}>‹</button>
+      Page ${this.activityPage+1} of ${totalPages}
+      <button onclick="Modules.legends.activityPage++;Modules.legends.renderActivityFeed()" ${this.activityPage>=totalPages-1?"disabled":""}>›</button>
+    `;
   },
   renderSection(key) {
     const meta = LEGEND_META.find(m => m.key === key);
     const container = document.getElementById("legend-" + key);
+    if (!STORE.legends[key]) STORE.legends[key] = meta.flat ? [] : []; // defensive: never let a missing key crash rendering
     if (meta.flat) {
       const items = STORE.legends[key];
-      container.innerHTML = `<div class="designation-legend-grid">` + items.map((item, i) => `
+      container.innerHTML = items.length ? `<div class="designation-legend-grid">` + items.map((item, i) => `
         <div class="dynamic-row" style="break-inside:avoid;">
           <span class="drtext">${esc(item)}</span>
           <button onclick="Modules.legends.editItem('${key}', ${i})" style="color:var(--olive-600);">✎</button>
           <button onclick="Modules.legends.deleteItem('${key}', ${i})">&times;</button>
         </div>
-      `).join("") + `</div>`;
+      `).join("") + `</div>` : `<p style="color:var(--text-muted);font-size:12px;">No entries yet.</p>`;
     } else {
-      container.innerHTML = STORE.legends[key].map((grp, gi) => `
+      const groups = STORE.legends[key];
+      container.innerHTML = groups.length ? groups.map((grp, gi) => `
         <div class="form-group-title">${esc(grp.group)}
           <button class="btn btn-outline btn-sm" style="float:right;padding:2px 8px;" onclick="Modules.legends.addSubItem('${key}',${gi})">+ Add</button>
         </div>
@@ -3553,7 +4158,7 @@ Modules.legends = {
             <button onclick="Modules.legends.deleteSubItem('${key}',${gi},${ii})">&times;</button>
           </div>
         `).join("")}
-      `).join("");
+      `).join("") : `<p style="color:var(--text-muted);font-size:12px;">No entries yet.</p>`;
     }
   },
   async addItem(key) {
@@ -3614,9 +4219,16 @@ Modules.legends = {
 </script>
 <script>
 /* =====================================================================
-   SETTINGS MODULE — Admin only: database adapter & appearance
+   SETTINGS MODULE — Admin only: real database connection & appearance.
+   The Local and Supabase adapters are fully implemented. AWS/Oracle/
+   Firebase are shown as planned slots in the same pluggable interface
+   (see js_02a_adapters.js: ADAPTERS registry) but are honestly marked
+   as not yet built — no card here claims a connection that doesn't
+   actually happen.
    ===================================================================== */
 Modules.settings = {
+  testResult: null,
+
   render() {
     const el = document.getElementById("mod-settings");
     if (!Auth.isAdmin()) {
@@ -3624,30 +4236,32 @@ Modules.settings = {
         <div class="panel"><div class="panel-body"><div class="empty-state"><h4>Admin access only</h4><p>Please contact your ADMIN to change system settings.</p></div></div></div>`;
       return;
     }
+    const cfg = ConnConfig.get();
     const s = STORE.settings;
-    const adapters = [
-      { key: "supabase", name: "Supabase", icon: "⚡" },
-      { key: "aws", name: "AWS", icon: "☁️" },
-      { key: "oracle", name: "Oracle", icon: "🗄️" },
-      { key: "firebase", name: "Firebase", icon: "🔥" }
+    const cards = [
+      { key: "local", name: "Local (Demo)", icon: "💾", status: "Fully working — zero setup, data is scoped to this session/browser only." },
+      { key: "supabase", name: "Supabase", icon: "⚡", status: "Fully working — real Postgres database, real auth, real access control." },
+      { key: "aws", name: "AWS", icon: "☁️", status: "Not yet built. The adapter slot exists (see ADAPTERS registry) — would need an RDS/DynamoDB adapter implemented here." },
+      { key: "oracle", name: "Oracle", icon: "🗄️", status: "Not yet built. Same pluggable slot — would need a TNS-based adapter (likely via a small backend proxy, since browsers can't speak Oracle's wire protocol directly)." },
+      { key: "firebase", name: "Firebase", icon: "🔥", status: "Not yet built. Same pluggable slot — would need a Firestore adapter implemented here." }
     ];
     el.innerHTML = `
       <div class="page-head"><div><h2>Settings</h2><div class="ph-sub">Database connection &amp; appearance — Admin only</div></div></div>
 
       <div class="panel">
-        <div class="panel-head"><h3>Database Connection</h3></div>
+        <div class="panel-head"><h3>Active Backend: ${DB.adapter.name === "supabase" ? "Supabase" : "Local (Demo)"} <span id="settingsPersistBadge"></span></h3></div>
         <div class="panel-body">
-          <p style="font-size:12.5px;color:var(--text-muted);margin-top:0;">Connect or migrate the system's data source. The app's screens are written against a single data-access layer, so switching adapters here does not require rebuilding any module.</p>
+          <p style="font-size:12.5px;color:var(--text-muted);margin-top:0;">Every screen in this app reads and writes through one data-access layer (<code>DB.get</code> / <code>DB.set</code>), so switching the backend here never requires changing Patients, Cases, OPD, Tasks, Directory, Legends, or Activity Logs.</p>
           <div class="db-adapter-grid">
-            ${adapters.map(a => `
-              <div class="db-adapter-card ${s.dbAdapter===a.key?'active':''}" onclick="Modules.settings.selectAdapter('${a.key}')">
-                <div class="dac-icon">${a.icon}</div>
-                <div class="dac-name">${a.name}</div>
-                <div class="dac-status">${s.dbAdapter===a.key ? (s.dbConnected ? '● Connected' : '○ Not connected') : 'Click to configure'}</div>
+            ${cards.map(c => `
+              <div class="db-adapter-card ${cfg.adapter===c.key?'active':''}" onclick="Modules.settings.showAdapter('${c.key}')">
+                <div class="dac-icon">${c.icon}</div>
+                <div class="dac-name">${c.name}</div>
+                <div class="dac-status">${cfg.adapter===c.key ? '● Active' : (c.key==='aws'||c.key==='oracle'||c.key==='firebase') ? '○ Not built' : 'Click to configure'}</div>
               </div>
             `).join("")}
           </div>
-          <div id="adapterInstructions" style="margin-top:18px;"></div>
+          <div id="adapterDetail" style="margin-top:18px;"></div>
         </div>
       </div>
 
@@ -3666,41 +4280,107 @@ Modules.settings = {
         <div class="panel-body kv-grid">
           <div class="kv-item"><div class="kl">Timezone</div><div class="kv">Asia/Manila (PHT, UTC+8)</div></div>
           <div class="kv-item"><div class="kl">Department Scope</div><div class="kv">OB-GYN (pilot) — expandable</div></div>
-          <div class="kv-item"><div class="kl">Current Adapter</div><div class="kv">${s.dbAdapter.toUpperCase()}</div></div>
-          <div class="kv-item"><div class="kl">Build</div><div class="kv">Demo v1.0</div></div>
+          <div class="kv-item"><div class="kl">Active Backend</div><div class="kv">${DB.adapter.name.toUpperCase()}</div></div>
+          <div class="kv-item"><div class="kl">Build</div><div class="kv">v1.1 — real Supabase adapter</div></div>
         </div>
       </div>
     `;
-    this.renderInstructions(s.dbAdapter);
+    this.showAdapter(cfg.adapter);
   },
-  selectAdapter(key) {
-    document.querySelectorAll(".db-adapter-card").forEach(c => c.classList.remove("active"));
-    event.currentTarget.classList.add("active");
-    this.renderInstructions(key);
+
+  showAdapter(key) {
+    document.querySelectorAll(".db-adapter-card").forEach((c,i) => {});
+    const cfg = ConnConfig.get();
+    const box = document.getElementById("adapterDetail");
+    if (key === "local") {
+      box.innerHTML = `
+        <div class="section-note">Claude's built-in session storage. Nothing to configure. Good for demos and trying out the app — not for real patient data, since it isn't a real shared database and is scoped to this browser session.</div>
+        ${cfg.adapter !== "local" ? `<button class="btn btn-outline" onclick="Modules.settings.activate('local')">Switch to Local (Demo)</button>` : `<span class="badge badge-active">Currently Active</span>`}
+      `;
+    } else if (key === "supabase") {
+      box.innerHTML = `
+        <div class="section-note">
+          <strong>Setup, once:</strong> create a free project at supabase.com, then run the setup SQL below in its SQL Editor. This creates the tables and the security rules that make this a real, access-controlled database instead of an open one.
+          <br><strong>Never</strong> paste your <code>service_role</code> key anywhere in this app — only the <code>anon</code> / public key from Supabase → Settings → API. The anon key is meant to be public; real protection comes from the Row Level Security rules the setup SQL creates.
+        </div>
+        <div class="row-2">
+          <div class="field"><label>Project URL</label><input id="sbUrl" placeholder="https://xxxxxxxx.supabase.co" value="${esc(cfg.supabaseUrl||'')}"></div>
+          <div class="field"><label>Anon (public) Key</label><input id="sbKey" placeholder="eyJhbGciOi..." value="${esc(cfg.supabaseAnonKey||'')}"></div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          <button class="btn btn-outline" onclick="Modules.settings.testSupabase()">Test Connection</button>
+          <button class="btn btn-primary" onclick="Modules.settings.activateSupabase()">Save &amp; Activate</button>
+          <button class="btn btn-outline" onclick="Modules.settings.showSQL()">View Setup SQL</button>
+          <button class="btn btn-outline" onclick="Modules.settings.downloadSQL()">Download Setup SQL (.sql)</button>
+        </div>
+        <div id="sbTestResult"></div>
+        ${cfg.adapter === "supabase" ? `
+          <div class="form-group-title">Migrate current data to Supabase</div>
+          <p style="font-size:12px;color:var(--text-muted);">Pushes everything currently in this session (patients, cases, OPD, tasks, directory, legends, activity) into the connected Supabase project. Requires being logged in through Supabase first (RLS only allows authenticated writes).</p>
+          <button class="btn btn-gold" onclick="Modules.settings.migrateToSupabase()" ${!STORE.session || !Auth.usingSupabase() ? "disabled" : ""}>Migrate Local Session Data →</button>
+          ${!Auth.usingSupabase() ? `<div class="hint">Log in through Supabase first (see below) to enable this.</div>` : ""}
+        ` : ""}
+      `;
+    } else {
+      box.innerHTML = `<div class="section-note">This adapter isn't implemented yet — this card exists to show the interface is genuinely pluggable (see <code>ADAPTERS</code> in the data layer), not to pretend a connection exists. Ask a developer to add a ${key} adapter following the same shape as the Supabase one when you're ready to add it.</div>`;
+    }
   },
-  renderInstructions(key) {
-    const box = document.getElementById("adapterInstructions");
-    const guides = {
-      supabase: { steps: ["Create a Supabase project and copy your Project URL and anon/service key.", "Paste them below, then Run to create the schema (users, patients, cases, opd, tasks, directory, activity, legends).", "Row-Level Security policies are generated per user_level automatically."], fields: ["Project URL", "Anon Key", "Service Role Key (server-side only)"] },
-      aws: { steps: ["Provision an RDS (PostgreSQL) instance or DynamoDB tables inside your VPC.", "Provide the connection endpoint and credentials; IAM roles are recommended over static keys.", "Recommended for units requiring on-prem network isolation."], fields: ["Endpoint", "Database Name", "IAM Role ARN / Access Key"] },
-      oracle: { steps: ["Point this system at your existing Oracle DB (recommended for units already on Oracle).", "Provide TNS connection details; the schema mapping mirrors the Supabase tables 1:1 for a low-friction migration.", "Recommended given AFP data security requirements."], fields: ["TNS Connection String", "Schema / Service Name", "Wallet / Credentials"] },
-      firebase: { steps: ["Create a Firebase project and enable Firestore.", "Provide your Firebase config object; collections map directly to the modules listed above.", "Best for rapid prototyping; migrate to Oracle/AWS for production deployment."], fields: ["Firebase Config (JSON)", "Project ID"] }
-    };
-    const g = guides[key];
-    box.innerHTML = `
-      <div class="section-note">${g.steps.map(s => `• ${s}`).join("<br>")}</div>
-      <div class="grid-2">
-        ${g.fields.map(f => `<div class="field"><label>${f}</label><input placeholder="Not connected in this demo"></div>`).join("")}
-      </div>
-      <button class="btn btn-primary" onclick="Modules.settings.connect('${key}')">Save &amp; Test Connection</button>
-    `;
+
+  async testSupabase() {
+    const cfg = { supabaseUrl: document.getElementById("sbUrl").value.trim().replace(/\/$/, ""), supabaseAnonKey: document.getElementById("sbKey").value.trim() };
+    document.getElementById("sbTestResult").innerHTML = `<div class="alert alert-warn">Testing…</div>`;
+    const result = await SupabaseAdapter.testConnection(cfg);
+    document.getElementById("sbTestResult").innerHTML = `<div class="alert alert-${result.ok ? 'ok' : 'danger'}">${esc(result.message)}</div>`;
   },
-  async connect(key) {
-    STORE.settings.dbAdapter = key; STORE.settings.dbConnected = true;
-    await DB.set("settings", STORE.settings);
-    document.getElementById("sbDbAdapter").textContent = key.charAt(0).toUpperCase() + key.slice(1);
-    UI.toast(`Connected to ${key.toUpperCase()} (demo)`);
-    this.render();
+
+  async activateSupabase() {
+    const url = document.getElementById("sbUrl").value.trim().replace(/\/$/, "");
+    const key = document.getElementById("sbKey").value.trim();
+    if (!url || !key) { UI.toast("Enter both the Project URL and anon key first", "err"); return; }
+    if (STORE.session) {
+      if (!confirm("Switching the active backend will sign you out (accounts live separately per backend). Continue?")) return;
+    }
+    await ConnConfig.save({ adapter: "supabase", supabaseUrl: url, supabaseAnonKey: key, supabaseAccessToken: "", supabaseRefreshToken: "", supabaseUserId: "" });
+    await activateAdapter("supabase", ConnConfig.get());
+    UI.toast("Supabase activated. Please sign in again.");
+    if (STORE.session) { STORE.session = null; document.getElementById("appShell").classList.remove("active"); document.getElementById("loginScreen").style.display = "flex"; Auth.showLogin(); }
+    else this.render();
+  },
+
+  async activate(key) {
+    if (STORE.session) { if (!confirm("Switching the active backend will sign you out. Continue?")) return; }
+    await ConnConfig.save({ adapter: key });
+    await activateAdapter(key, ConnConfig.get());
+    UI.toast(`${key} activated. Please sign in again.`);
+    if (STORE.session) { STORE.session = null; document.getElementById("appShell").classList.remove("active"); document.getElementById("loginScreen").style.display = "flex"; Auth.showLogin(); }
+    else this.render();
+  },
+
+  showSQL() {
+    UI.openModal("Supabase Setup SQL", `
+      <p style="font-size:12.5px;color:var(--text-muted);">Copy this into Supabase → SQL Editor → New query → Run. Safe to re-run any time.</p>
+      <textarea readonly style="width:100%;height:360px;font-family:var(--font-mono);font-size:11px;padding:10px;border:1px solid var(--border-color);border-radius:6px;" onclick="this.select()">${esc(SUPABASE_SETUP_SQL)}</textarea>
+    `, `<button class="btn btn-outline" onclick="UI.closeModal()">Close</button>
+        <button class="btn btn-primary" onclick="Modules.settings.downloadSQL()">Download .sql</button>`, "wide");
+  },
+
+  downloadSQL() {
+    const blob = new Blob([SUPABASE_SETUP_SQL], { type: "text/plain;charset=utf-8;" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "afpvluna_supabase_setup.sql";
+    link.click();
+  },
+
+  async migrateToSupabase() {
+    if (!STORE.session || !Auth.usingSupabase()) { UI.toast("Log in through Supabase first", "err"); return; }
+    const keys = ["patients", "cases", "opd", "tasks", "directory", "legends", "activity"];
+    let ok = 0, fail = 0;
+    for (const k of keys) {
+      const success = await DB.set(k, STORE[k]);
+      if (success) ok++; else fail++;
+    }
+    UI.toast(fail === 0 ? `Migrated ${ok} collection(s) to Supabase` : `Migrated ${ok}, ${fail} failed — check the connection`, fail ? "err" : "ok");
   }
 };
 </script>
